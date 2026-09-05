@@ -4,14 +4,17 @@ The module lives under examples/ (not a package under src/) and depends only
 on the stdlib, viam-sdk and numpy (isaac_module is imported lazily, only in
 --mock code paths), so it is loaded here via importlib rather than adding
 examples/ to pyproject's pythonpath - mirrors
-tests/test_gpu_checklist_phase2.py's idiom exactly.
+tests/test_gpu_checklist_camera.py's idiom exactly.
 """
 
+import argparse
 import asyncio
 import importlib.util
 import json
+import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -38,6 +41,16 @@ HELD_BLOCK_TRANSFORM_MARKER = pick_red_block.HELD_BLOCK_TRANSFORM_MARKER
 DETECTED_BLOCK_POSE_MARKER = pick_red_block.DETECTED_BLOCK_POSE_MARKER
 HOLD_SAMPLES_MARKER = pick_red_block.HOLD_SAMPLES_MARKER
 RESET_MID_HOLD_MARKER = pick_red_block.RESET_MID_HOLD_MARKER
+MEASURED_BLOCK_MARKER = pick_red_block.MEASURED_BLOCK_MARKER
+JAW_MAX_BLOCK_MM = pick_red_block.JAW_MAX_BLOCK_MM
+footprint_extents_mm = pick_red_block.footprint_extents_mm
+measured_block_size_mm = pick_red_block.measured_block_size_mm
+TallestEstimate = pick_red_block.TallestEstimate
+tallest_in_region_mm = pick_red_block.tallest_in_region_mm
+keepout_height_mm = pick_red_block.keepout_height_mm
+carry_clear_above_support_mm = pick_red_block.carry_clear_above_support_mm
+tallest_sweep_attempts = pick_red_block.tallest_sweep_attempts
+MEASURED_TALLEST_MARKER = pick_red_block.MEASURED_TALLEST_MARKER
 main = pick_red_block.main
 
 
@@ -145,7 +158,9 @@ def test_red_centroid_m_raises_when_no_red_points():
 
 
 def test_main_mock_runs_the_full_pick_sequence(capsys):
-    exit_code = main(["--mock", "--hold-s", "0"])
+    # --block-size-mm explicit: today's fixed-size path, no measurement (the
+    # mock's default fixed pixel rectangle measures ~82 mm, over the jaw limit)
+    exit_code = main(["--mock", "--hold-s", "0", "--block-size-mm", "60"])
 
     out = capsys.readouterr().out
     assert exit_code == 0
@@ -181,7 +196,7 @@ def test_look_pose_points_the_camera_down_at_the_requested_point():
 
 
 def test_main_mock_runs_the_look_step_before_detect(capsys):
-    assert pick_red_block.main(["--mock", "--hold-s", "0"]) == 0
+    assert pick_red_block.main(["--mock", "--hold-s", "0", "--block-size-mm", "60"]) == 0
     out = capsys.readouterr().out
     assert out.index("step: look") < out.index("step: detect")
 
@@ -189,7 +204,7 @@ def test_main_mock_runs_the_look_step_before_detect(capsys):
 def test_main_mock_holds_and_survives_a_reset_mid_hold(capsys, monkeypatch):
     monkeypatch.setattr(pick_red_block, "RESET_SETTLE_S", 0.05)
     monkeypatch.setattr(pick_red_block, "HOLD_SAMPLE_S", 0.05)
-    exit_code = main(["--mock", "--hold-s", "0.1", "--reset-mid-hold"])
+    exit_code = main(["--mock", "--hold-s", "0.1", "--reset-mid-hold", "--block-size-mm", "60"])
 
     out = capsys.readouterr().out
     assert exit_code == 0
@@ -911,7 +926,7 @@ def test_randomize_derives_movable_names_from_the_scene(monkeypatch):
 
     randomize = next(c for c in fakes.commands if c["command"] == "randomize_props")
     assert randomize["names"] == ["pick_cube", "ignore_cube_green"]
-    assert randomize["min_separation"] == 200.0  # FINDINGS W26
+    assert randomize["min_separation"] == 140.0  # six-block packing envelope
 
 
 def test_randomize_skipped_when_the_scene_has_no_movables(monkeypatch):
@@ -1121,3 +1136,776 @@ def test_randomized_carry_plans_freely_over_the_keepout(monkeypatch):
     assert "pick_area_keepout" in carry_labels
     (transform,) = carry_state.transforms  # the held block still rides along
     assert transform.reference_frame == "pick_cube"
+
+
+def _footprint_points(
+    x_mm: float, y_mm: float, n: int = 500, seed: int = 0, top_depth_m: float = 0.29
+):
+    """Synthetic segment (camera frame, metres) the band estimator sees: a
+    top face of n points at ``top_depth_m`` spread over an x_mm by y_mm
+    footprint, a floor patch 60 mm deeper and twice as wide (the band must
+    exclude it), and two in-band outliers past the 2nd/98th percentile trim
+    so the trim's effect is exercised."""
+    rng = np.random.default_rng(seed)
+    half_x_m, half_y_m = x_mm / 2000.0, y_mm / 2000.0
+    xy = np.column_stack([rng.uniform(-half_x_m, half_x_m, n), rng.uniform(-half_y_m, half_y_m, n)])
+    z = np.full((n, 1), top_depth_m, dtype=np.float32)
+    top = np.column_stack([xy, z]).astype(np.float32)
+    floor_xy = np.column_stack(
+        [rng.uniform(-2 * half_x_m, 2 * half_x_m, n), rng.uniform(-2 * half_y_m, 2 * half_y_m, n)]
+    )
+    floor = np.column_stack([floor_xy, np.full((n, 1), top_depth_m + 0.06)]).astype(np.float32)
+    outliers = np.array(
+        [
+            [half_x_m * 10, half_y_m * 10, top_depth_m],
+            [-half_x_m * 10, -half_y_m * 10, top_depth_m],
+        ],
+        dtype=np.float32,
+    )
+    return np.vstack([top, outliers, floor])
+
+
+def test_footprint_extents_mm_trims_outliers_at_40mm():
+    footprint = footprint_extents_mm(_footprint_points(40.0, 40.0))
+    assert footprint is not None
+    assert footprint[0] == pytest.approx(40.0, rel=0.15)
+    assert footprint[1] == pytest.approx(40.0, rel=0.15)
+
+
+def test_footprint_extents_mm_trims_outliers_at_75mm():
+    footprint = footprint_extents_mm(_footprint_points(75.0, 60.0))
+    assert footprint is not None
+    assert footprint[0] == pytest.approx(75.0, rel=0.15)
+    assert footprint[1] == pytest.approx(60.0, rel=0.15)
+
+
+def test_footprint_extents_mm_ignores_the_deeper_floor_band():
+    # the floor patch is twice the block's width; measuring it would double
+    # the extents, so a correct band selection is what keeps this ~40 mm
+    footprint = footprint_extents_mm(_footprint_points(40.0, 40.0))
+    assert footprint is not None
+    assert footprint[0] < 60.0 and footprint[1] < 60.0
+
+
+def test_footprint_extents_mm_none_when_only_gripper_depth_points():
+    xyz = np.array([[0.0, 0.0, 0.05], [0.01, 0.0, 0.06]], dtype=np.float32)
+    assert footprint_extents_mm(xyz) is None
+
+
+def test_measured_block_size_mm_takes_the_median_at_40mm():
+    result = measured_block_size_mm([39.0, 41.0, 40.5])
+    assert result is not None
+    size_mm, estimates = result
+    assert size_mm == pytest.approx(40.5)
+    assert estimates == [39.0, 41.0, 40.5]
+
+
+def test_measured_block_size_mm_takes_the_median_at_75mm():
+    result = measured_block_size_mm([74.0, 76.0, 75.5])
+    assert result is not None
+    size_mm, _ = result
+    assert size_mm == pytest.approx(75.5)
+
+
+def test_measured_block_size_mm_flags_a_degenerate_view():
+    # height reads 60 against a ~40 mm footprint - a 50% spread, over the 25% cross-check
+    assert measured_block_size_mm([40.0, 40.0, 60.0]) is None
+
+
+def test_parse_randomize_size_mm_accepts_lo_hi():
+    assert pick_red_block._parse_randomize_size_mm("30,90") == (30.0, 90.0)
+
+
+def test_parse_randomize_size_mm_rejects_inverted_range():
+    with pytest.raises(argparse.ArgumentTypeError):
+        pick_red_block._parse_randomize_size_mm("90,30")
+
+
+def test_parse_randomize_size_mm_rejects_non_positive():
+    with pytest.raises(argparse.ArgumentTypeError):
+        pick_red_block._parse_randomize_size_mm("0,90")
+
+
+def test_randomize_props_payload_omits_size_range_by_default(monkeypatch):
+    monkeypatch.setattr(pick_red_block, "RESET_SETTLE_S", 0.0)
+    commands: list[dict] = []
+
+    class FakeWorld:
+        async def do_command(self, command):
+            commands.append(dict(command))
+            if command["command"] == "randomize_props":
+                return {"positions": {"pick_cube": [100.0, 200.0, 30.0]}}
+            return {"geometries": [_prop_geometry("pick_cube", [60.0, 60.0, 60.0])]}
+
+    class FakeDetector:
+        async def block_pose_world(self):
+            return Pose(x=100.0, y=200.0, z=30.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
+
+    class FakeMover:
+        async def look_from(self, pose, world_state):
+            return None
+
+        async def move_to(self, pose, world_state, linear=False):
+            return None
+
+    class FakeGripper:
+        async def open(self):
+            return None
+
+        async def grab(self):
+            return True
+
+        async def is_holding_something(self):
+            return True
+
+    pipeline = pick_red_block.PickPipeline(
+        detector=FakeDetector(),
+        mover=FakeMover(),
+        gripper=FakeGripper(),
+        block_name="pick_cube",
+        block_size_mm=60.0,
+        gripper_name="pick-grip",
+        world=FakeWorld(),
+        target_prop_name="pick_cube",
+        movable_prop_names=["pick_cube"],
+        randomize_seed=7,
+    )
+    asyncio.run(pipeline.run())
+
+    randomize_command = next(c for c in commands if c["command"] == "randomize_props")
+    assert "size_range_mm" not in randomize_command
+
+
+def test_randomize_props_payload_carries_size_range_mm_when_set(monkeypatch):
+    monkeypatch.setattr(pick_red_block, "RESET_SETTLE_S", 0.0)
+    commands: list[dict] = []
+
+    class FakeWorld:
+        async def do_command(self, command):
+            commands.append(dict(command))
+            if command["command"] == "randomize_props":
+                return {"positions": {"pick_cube": [100.0, 200.0, 30.0]}}
+            return {"geometries": [_prop_geometry("pick_cube", [60.0, 60.0, 60.0])]}
+
+    class FakeDetector:
+        async def block_pose_world(self):
+            return Pose(x=100.0, y=200.0, z=30.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
+
+    class FakeMover:
+        async def look_from(self, pose, world_state):
+            return None
+
+        async def move_to(self, pose, world_state, linear=False):
+            return None
+
+    class FakeGripper:
+        async def open(self):
+            return None
+
+        async def grab(self):
+            return True
+
+        async def is_holding_something(self):
+            return True
+
+    pipeline = pick_red_block.PickPipeline(
+        detector=FakeDetector(),
+        mover=FakeMover(),
+        gripper=FakeGripper(),
+        block_name="pick_cube",
+        block_size_mm=60.0,
+        gripper_name="pick-grip",
+        world=FakeWorld(),
+        target_prop_name="pick_cube",
+        movable_prop_names=["pick_cube"],
+        randomize_seed=7,
+        randomize_size_range_mm=(30.0, 90.0),
+    )
+    asyncio.run(pipeline.run())
+
+    randomize_command = next(c for c in commands if c["command"] == "randomize_props")
+    assert randomize_command["size_range_mm"] == [30.0, 90.0]
+
+
+def test_jaw_refusal_skips_the_grasp_and_leaves_the_arm_parked(capsys):
+    class FakeMeasuredDetector:
+        async def block_pose_world(self):
+            return Pose(x=100.0, y=200.0, z=40.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
+
+        def last_measurement(self):
+            return {"footprint_mm": [80.0, 80.0], "height_mm": 80.0, "size_mm": 80.0}
+
+    class RefusingMover:
+        async def look_from(self, pose, world_state):
+            raise AssertionError("the arm must stay parked on a jaw refusal")
+
+        async def move_to(self, pose, world_state, linear=False):
+            raise AssertionError("the arm must stay parked on a jaw refusal")
+
+    class RefusingGripper:
+        async def open(self):
+            raise AssertionError("no grasp should be attempted on a jaw refusal")
+
+        async def grab(self):
+            raise AssertionError("no grasp should be attempted on a jaw refusal")
+
+        async def is_holding_something(self):
+            raise AssertionError("not exercised in this test")
+
+    pipeline = pick_red_block.PickPipeline(
+        detector=FakeMeasuredDetector(),
+        mover=RefusingMover(),
+        gripper=RefusingGripper(),
+        block_name="pick_cube",
+        block_size_mm=None,
+        gripper_name="pick-grip",
+        verify_detection_height=False,
+    )
+
+    with pytest.raises(RuntimeError, match="jaw"):
+        asyncio.run(pipeline.run())
+    assert f"{JAW_MAX_BLOCK_MM:.0f} mm jaw" in capsys.readouterr().out
+
+
+class _MeasurementFakes:
+    """Pipeline fakes whose detector serves (pose, measurement) pairs from a
+    queue, for the degenerate-measurement re-scan path."""
+
+    def __init__(self, readings):
+        self.look_poses = []
+        queue = list(readings)
+        outer = self
+
+        class World:
+            async def do_command(self, command):
+                if command["command"] == "randomize_props":
+                    return {"positions": {"pick_cube": [580.0, 5.0, 20.0]}}
+                return {"geometries": []}
+
+        class Detector:
+            def __init__(self):
+                self._measurement = None
+
+            async def block_pose_world(self):
+                pose, measurement = queue.pop(0)
+                self._measurement = measurement
+                return pose
+
+            def last_measurement(self):
+                return self._measurement
+
+        class Mover:
+            async def look_from(self, pose, world_state):
+                outer.look_poses.append(pose)
+
+            async def move_to(self, pose, world_state, linear=False):
+                return None
+
+        class Gripper:
+            async def open(self):
+                return None
+
+            async def grab(self):
+                return True
+
+            async def is_holding_something(self):
+                return True
+
+        self.pipeline = pick_red_block.PickPipeline(
+            detector=Detector(),
+            mover=Mover(),
+            gripper=Gripper(),
+            block_name="pick_cube",
+            block_size_mm=None,
+            gripper_name="pick-grip",
+            world=World(),
+            target_prop_name="pick_cube",
+            movable_prop_names=("pick_cube",),
+            randomize_seed=3,
+            look_pose=pick_red_block._pointing_down(500.0, 150.0, 350.0),
+        )
+
+
+def test_detection_retries_on_a_degenerate_size_measurement(monkeypatch, capsys):
+    monkeypatch.setattr(pick_red_block, "RESET_SETTLE_S", 0.0)
+    degenerate_pose = Pose(x=580.0, y=5.0, z=999.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
+    accepted_pose = Pose(x=580.0, y=5.0, z=20.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
+    fakes = _MeasurementFakes(
+        [
+            (degenerate_pose, None),  # footprint/height disagree by >25% - re-scan
+            (
+                accepted_pose,
+                {"footprint_mm": [40.0, 40.0], "height_mm": 40.0, "size_mm": 40.0},
+            ),
+        ]
+    )
+
+    transform = asyncio.run(fakes.pipeline.run())
+
+    assert len(fakes.look_poses) == 2  # one re-scan before the accepted measurement
+    assert transform.physical_object.box.dims_mm.x == 40.0
+    out = capsys.readouterr().out
+    assert "degenerate size measurement" in out
+    measured_line = next(
+        line for line in out.splitlines() if line.startswith(MEASURED_BLOCK_MARKER)
+    )
+    measured = json.loads(measured_line.removeprefix(MEASURED_BLOCK_MARKER))
+    assert measured["size_mm"] == 40.0
+
+
+def test_main_mock_measures_a_non_60mm_block_and_completes_the_pick(capsys):
+    # the mock-wrist-cam handle is cached by name for the process (XC-4): a
+    # spawn attribute (block_size_mm) changing from whatever an earlier test
+    # left behind is rejected unless the cached handle is released first
+    SimManager.get().release_handle("mock-wrist-cam")
+    try:
+        exit_code = main(["--mock", "--hold-s", "0", "--mock-block-size-mm", "50"])
+
+        out = capsys.readouterr().out
+        assert exit_code == 0
+        assert "grab: True" in out
+
+        measured_line = next(
+            line for line in out.splitlines() if line.startswith(MEASURED_BLOCK_MARKER)
+        )
+        measured = json.loads(measured_line.removeprefix(MEASURED_BLOCK_MARKER))
+        assert measured["size_mm"] == pytest.approx(50.0, rel=0.1)
+    finally:
+        SimManager.get().release_handle("mock-wrist-cam")
+
+
+_TALLEST_REGION_MM = ([500.0, -100.0, 0.0], [700.0, 100.0, 0.0])
+_TALLEST_SIZE_RANGE_MM = (50.0, 70.0)
+
+
+def _region_quadrant_points(region_mm, z_mm, count_per_quadrant=50, seed=0):
+    """count_per_quadrant synthetic points (world mm) spread evenly across
+    each of the region footprint's four quadrants, all at ``z_mm``."""
+    rng = np.random.default_rng(seed)
+    (x0, y0, _z0), (x1, y1, _z1) = region_mm
+    lo_x, hi_x = min(x0, x1), max(x0, x1)
+    lo_y, hi_y = min(y0, y1), max(y0, y1)
+    mid_x, mid_y = (lo_x + hi_x) / 2.0, (lo_y + hi_y) / 2.0
+    quadrants = []
+    for x_lo, x_hi in ((lo_x, mid_x), (mid_x, hi_x)):
+        for y_lo, y_hi in ((lo_y, mid_y), (mid_y, hi_y)):
+            xs = rng.uniform(x_lo + 1.0, x_hi - 1.0, count_per_quadrant)
+            ys = rng.uniform(y_lo + 1.0, y_hi - 1.0, count_per_quadrant)
+            zs = np.full(count_per_quadrant, z_mm)
+            quadrants.append(np.column_stack([xs, ys, zs]))
+    return np.vstack(quadrants)
+
+
+def test_tallest_in_region_clean_cloud_is_trusted_with_the_max_height():
+    cloud = _region_quadrant_points(_TALLEST_REGION_MM, 60.0)
+    estimate = tallest_in_region_mm(cloud, _TALLEST_REGION_MM, 0.0, _TALLEST_SIZE_RANGE_MM)
+    assert estimate.trusted
+    assert estimate.reasons == []
+    assert estimate.tallest_mm == pytest.approx(60.0)
+    assert estimate.points == 200
+
+
+def test_tallest_in_region_clips_to_the_region_footprint():
+    cloud = _region_quadrant_points(_TALLEST_REGION_MM, 60.0)
+    outside = np.array([[900.0, 900.0, 500.0]] * 10)
+    estimate = tallest_in_region_mm(
+        np.vstack([cloud, outside]), _TALLEST_REGION_MM, 0.0, _TALLEST_SIZE_RANGE_MM
+    )
+    assert estimate.tallest_mm == pytest.approx(60.0)
+    assert estimate.points == 200
+
+
+def test_tallest_in_region_drops_points_at_or_below_the_support():
+    cloud = _region_quadrant_points(_TALLEST_REGION_MM, 60.0)
+    support_points = _region_quadrant_points(_TALLEST_REGION_MM, 0.0, seed=1)
+    estimate = tallest_in_region_mm(
+        np.vstack([cloud, support_points]), _TALLEST_REGION_MM, 0.0, _TALLEST_SIZE_RANGE_MM
+    )
+    assert estimate.points == 200
+    assert estimate.tallest_mm == pytest.approx(60.0)
+
+
+def test_tallest_in_region_point_floor_reason_fires_alone():
+    cloud = _region_quadrant_points(_TALLEST_REGION_MM, 60.0, count_per_quadrant=12)
+    estimate = tallest_in_region_mm(cloud, _TALLEST_REGION_MM, 0.0, _TALLEST_SIZE_RANGE_MM)
+    assert not estimate.trusted
+    assert any("point floor" in reason for reason in estimate.reasons)
+    assert not any("size window" in reason for reason in estimate.reasons)
+    assert not any("lone-point top" in reason for reason in estimate.reasons)
+    assert not any("quadrant" in reason for reason in estimate.reasons)
+
+
+def test_tallest_in_region_size_window_reason_fires_alone():
+    cloud = _region_quadrant_points(_TALLEST_REGION_MM, 200.0)
+    estimate = tallest_in_region_mm(cloud, _TALLEST_REGION_MM, 0.0, _TALLEST_SIZE_RANGE_MM)
+    assert not estimate.trusted
+    assert any("size window" in reason for reason in estimate.reasons)
+    assert not any("point floor" in reason for reason in estimate.reasons)
+    assert not any("lone-point top" in reason for reason in estimate.reasons)
+    assert not any("quadrant" in reason for reason in estimate.reasons)
+
+
+def test_tallest_in_region_lone_point_top_reason_fires_alone():
+    bulk = _region_quadrant_points(_TALLEST_REGION_MM, 60.0)
+    outliers = np.array([[550.0, -50.0, 75.0], [550.0, -40.0, 75.0], [550.0, -30.0, 75.0]])
+    estimate = tallest_in_region_mm(
+        np.vstack([bulk, outliers]), _TALLEST_REGION_MM, 0.0, _TALLEST_SIZE_RANGE_MM
+    )
+    assert not estimate.trusted
+    assert estimate.tallest_mm == pytest.approx(75.0)
+    assert any("lone-point top" in reason for reason in estimate.reasons)
+    assert not any("point floor" in reason for reason in estimate.reasons)
+    assert not any("size window" in reason for reason in estimate.reasons)
+    assert not any("quadrant" in reason for reason in estimate.reasons)
+
+
+def test_tallest_in_region_quadrant_coverage_reason_fires_alone():
+    rng = np.random.default_rng(2)
+    xs = rng.uniform(501.0, 599.0, 200)
+    ys = rng.uniform(-99.0, -1.0, 200)
+    cloud = np.column_stack([xs, ys, np.full(200, 60.0)])
+    estimate = tallest_in_region_mm(cloud, _TALLEST_REGION_MM, 0.0, _TALLEST_SIZE_RANGE_MM)
+    assert not estimate.trusted
+    assert any("quadrant" in reason for reason in estimate.reasons)
+    assert not any("point floor" in reason for reason in estimate.reasons)
+    assert not any("size window" in reason for reason in estimate.reasons)
+    assert not any("lone-point top" in reason for reason in estimate.reasons)
+
+
+def test_tallest_in_region_skips_the_quadrant_check_without_a_region():
+    rng = np.random.default_rng(3)
+    xs = rng.uniform(-5000.0, 5000.0, 150)
+    ys = rng.uniform(-5000.0, 5000.0, 150)
+    cloud = np.column_stack([xs, ys, np.full(150, 60.0)])
+    estimate = tallest_in_region_mm(cloud, None, 0.0, _TALLEST_SIZE_RANGE_MM)
+    assert estimate.trusted
+    assert estimate.reasons == []
+    assert estimate.tallest_mm == pytest.approx(60.0)
+    assert estimate.points == 150
+
+
+def test_keepout_height_mm_matches_the_gpu_validated_anchor():
+    assert keepout_height_mm(60.0, 60.0) == 130.0
+
+
+def test_carry_clear_above_support_mm_matches_the_gpu_validated_anchor():
+    assert carry_clear_above_support_mm(60.0, 60.0) == 200.0
+
+
+def test_keepout_height_and_carry_clear_strictly_increase_with_tallest():
+    tallest_values = [30.0, 60.0, 90.0, 120.0]
+    keepouts = [keepout_height_mm(t, 60.0) for t in tallest_values]
+    carries = [carry_clear_above_support_mm(t, 60.0) for t in tallest_values]
+    assert keepouts == sorted(keepouts)
+    assert len(set(keepouts)) == len(keepouts)
+    assert carries == sorted(carries)
+    assert len(set(carries)) == len(carries)
+
+
+def test_keepout_height_mm_stays_within_tallest_plus_150_over_a_grid():
+    for tallest_mm in (30.0, 60.0, 90.0, 120.0):
+        for held_mm in (30.0, 50.0, 75.0):
+            height = keepout_height_mm(tallest_mm, held_mm)
+            assert tallest_mm < height < tallest_mm + 150.0
+
+
+def test_tallest_sweep_attempts_leads_with_four_region_corners_then_scan_attempts():
+    """Corners first: a region-centre vantage hangs the gripper inside the
+    footprint where it reads as a ~274 mm object (GPU phase-4 run 1)."""
+    attempts = tallest_sweep_attempts(_TALLEST_REGION_MM)
+    scan_attempts = pick_red_block.SCAN_ATTEMPTS
+    assert attempts[4:] == scan_attempts
+    assert len(attempts) == len(scan_attempts) + 4
+
+
+def test_tallest_sweep_attempts_corner_offsets_stay_inside_the_region():
+    (x0, y0, _z0), (x1, y1, _z1) = _TALLEST_REGION_MM
+    lo_x, hi_x = min(x0, x1), max(x0, x1)
+    lo_y, hi_y = min(y0, y1), max(y0, y1)
+    centre_x, centre_y = (lo_x + hi_x) / 2.0, (lo_y + hi_y) / 2.0
+    corners = tallest_sweep_attempts(_TALLEST_REGION_MM)[:4]
+    assert len(corners) == 4
+    for x_offset, y_offset, theta in corners:
+        assert lo_x <= centre_x + x_offset <= hi_x
+        assert lo_y <= centre_y + y_offset <= hi_y
+        assert theta == 0.0
+
+
+def test_pick_area_keepout_defaults_to_the_legacy_height():
+    keepout = pick_red_block.pick_area_keepout(([450.0, -250.0, 0.0], [700.0, 250.0, 0.0]))
+    assert keepout.box.dims_mm.z == pick_red_block.KEEPOUT_HEIGHT_MM
+
+
+def test_pick_area_keepout_honours_a_custom_height_mm():
+    keepout = pick_red_block.pick_area_keepout(
+        ([450.0, -250.0, 0.0], [700.0, 250.0, 0.0]), height_mm=180.0
+    )
+    assert keepout.box.dims_mm.z == 180.0
+    assert keepout.center.z == 90.0
+
+
+def test_measured_tallest_marker_is_a_distinct_marker_string():
+    assert MEASURED_TALLEST_MARKER == "MEASURED_TALLEST_JSON="
+
+
+def test_main_mock_measures_tallest_from_the_side_camera(capsys):
+    SimManager.get().release_handle("mock-wrist-cam")
+    SimManager.get().release_handle("mock-side-cam")
+    try:
+        exit_code = main(
+            ["--mock", "--hold-s", "0", "--block-size-mm", "60", "--randomize-size-mm", "30,90"]
+        )
+        out = capsys.readouterr().out
+        assert exit_code == 0
+        assert "grab: True" in out
+
+        tallest_line = next(
+            line for line in out.splitlines() if line.startswith(MEASURED_TALLEST_MARKER)
+        )
+        marker = json.loads(tallest_line.removeprefix(MEASURED_TALLEST_MARKER))
+        assert marker["source"] == "side"
+        assert marker["trusted"] is True
+        assert marker["tallest_mm"] == pytest.approx(90.0, abs=10.0)
+        assert marker["keepout_height_mm"] == pytest.approx(
+            keepout_height_mm(marker["tallest_mm"], 60.0)
+        )
+        assert marker["carry_clear_above_support_mm"] == pytest.approx(
+            carry_clear_above_support_mm(marker["tallest_mm"], 60.0)
+        )
+    finally:
+        SimManager.get().release_handle("mock-wrist-cam")
+        SimManager.get().release_handle("mock-side-cam")
+
+
+class _FakeMover:
+    def __init__(self):
+        self.looked = []
+
+    async def look_from(self, pose, world_state):
+        self.looked.append(pose)
+
+    async def move_to(self, pose, world_state, linear=False):
+        return None
+
+
+class _FakeScanner:
+    def __init__(self, clouds):
+        self._clouds = list(clouds)
+
+    async def scan_world_mm(self):
+        return self._clouds.pop(0)
+
+
+def test_measure_tallest_falls_through_side_then_wrist_sweep_to_first_trusted(monkeypatch):
+    estimates = [
+        pick_red_block.TallestEstimate(tallest_mm=10.0, points=1, trusted=False, reasons=["r0"]),
+        pick_red_block.TallestEstimate(tallest_mm=20.0, points=1, trusted=False, reasons=["r1"]),
+        pick_red_block.TallestEstimate(tallest_mm=90.0, points=500, trusted=True, reasons=[]),
+    ]
+
+    def fake_tallest(points, region_mm, support_z_mm, size_range_mm):
+        return estimates.pop(0)
+
+    monkeypatch.setattr(pick_red_block, "tallest_in_region_mm", fake_tallest)
+    monkeypatch.setattr(
+        pick_red_block,
+        "tallest_sweep_attempts",
+        lambda region: ((0.0, 0.0, 0.0), (10.0, 0.0, 90.0)),
+    )
+
+    mover = _FakeMover()
+    side_scanner = _FakeScanner([np.zeros((1, 3))])
+    wrist_scanner = _FakeScanner([np.zeros((1, 3)), np.zeros((1, 3))])
+    pipeline = pick_red_block.PickPipeline(
+        detector=None,
+        mover=mover,
+        gripper=None,
+        block_name="pick_cube",
+        block_size_mm=60.0,
+        gripper_name="pick-grip",
+        randomize_size_range_mm=(30.0, 90.0),
+        pick_region_mm=([500.0, -100.0, 0.0], [700.0, 100.0, 0.0]),
+        scan_centre_mm=(600.0, 0.0),
+        look_pose=pick_red_block._pointing_down(500.0, 150.0, 350.0),
+        side_scanner=side_scanner,
+        wrist_scanner=wrist_scanner,
+        verify_detection_height=True,
+        support_z_mm=0.0,
+    )
+
+    asyncio.run(pipeline._measure_tallest(pick_red_block.world_state(None)))
+
+    assert pipeline.tallest_source == "wrist_sweep"
+    assert pipeline.tallest_estimate.trusted is True
+    assert pipeline.tallest_estimate.tallest_mm == pytest.approx(90.0)
+    assert len(mover.looked) == 2  # walked both wrist-sweep attempts before the second won
+    assert len(pipeline.tallest_scan_poses_mm) == 2
+
+
+def test_measure_tallest_falls_back_to_size_range_max_when_everything_is_untrusted(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        pick_red_block,
+        "tallest_in_region_mm",
+        lambda *a, **k: pick_red_block.TallestEstimate(
+            tallest_mm=5.0, points=1, trusted=False, reasons=["nope"]
+        ),
+    )
+    monkeypatch.setattr(pick_red_block, "tallest_sweep_attempts", lambda region: ((0.0, 0.0, 0.0),))
+
+    mover = _FakeMover()
+    pipeline = pick_red_block.PickPipeline(
+        detector=None,
+        mover=mover,
+        gripper=None,
+        block_name="pick_cube",
+        block_size_mm=60.0,
+        gripper_name="pick-grip",
+        randomize_size_range_mm=(30.0, 90.0),
+        pick_region_mm=([500.0, -100.0, 0.0], [700.0, 100.0, 0.0]),
+        scan_centre_mm=(600.0, 0.0),
+        look_pose=pick_red_block._pointing_down(500.0, 150.0, 350.0),
+        side_scanner=_FakeScanner([np.zeros((1, 3))]),
+        wrist_scanner=_FakeScanner([np.zeros((1, 3))]),
+        verify_detection_height=True,
+    )
+
+    asyncio.run(pipeline._measure_tallest(pick_red_block.world_state(None)))
+
+    assert pipeline.tallest_source == "fallback"
+    assert pipeline.tallest_estimate.trusted is False
+    assert pipeline.tallest_estimate.tallest_mm == 90.0
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_measure_tallest_runs_the_wrist_sweep_without_a_side_scanner(monkeypatch):
+    """GPU phase-4 run 3: --tallest-camera "" must still sweep the wrist
+    camera, not jump straight to the size-range ceiling."""
+    monkeypatch.setattr(
+        pick_red_block,
+        "tallest_in_region_mm",
+        lambda *a, **k: pick_red_block.TallestEstimate(
+            tallest_mm=81.0, points=500, trusted=True, reasons=[]
+        ),
+    )
+    monkeypatch.setattr(pick_red_block, "tallest_sweep_attempts", lambda region: ((0.0, 0.0, 0.0),))
+
+    pipeline = pick_red_block.PickPipeline(
+        detector=None,
+        mover=_FakeMover(),
+        gripper=None,
+        block_name="pick_cube",
+        block_size_mm=60.0,
+        gripper_name="pick-grip",
+        randomize_size_range_mm=(30.0, 90.0),
+        pick_region_mm=([500.0, -100.0, 0.0], [700.0, 100.0, 0.0]),
+        scan_centre_mm=(600.0, 0.0),
+        look_pose=pick_red_block._pointing_down(500.0, 150.0, 350.0),
+        side_scanner=None,
+        wrist_scanner=_FakeScanner([np.zeros((1, 3))]),
+        verify_detection_height=True,
+    )
+
+    asyncio.run(pipeline._measure_tallest(pick_red_block.world_state(None)))
+
+    assert pipeline.tallest_source == "wrist_sweep"
+    assert pipeline.tallest_estimate.trusted is True
+    assert pipeline.tallest_estimate.tallest_mm == 81.0
+
+
+def test_camera_world_transform_mm_recovers_a_known_rotation_and_translation():
+    theta = math.radians(37.0)
+    rotation_true = np.array(
+        [
+            [math.cos(theta), -math.sin(theta), 0.0],
+            [math.sin(theta), math.cos(theta), 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    translation_true = np.array([500.0, -200.0, 900.0])
+
+    class FakeRobot:
+        async def transform_pose(self, pose_in_frame, dest_frame):
+            p = pose_in_frame.pose
+            cam_point = np.array([p.x, p.y, p.z])
+            world_point = rotation_true @ cam_point + translation_true
+            return SimpleNamespace(
+                pose=Pose(
+                    x=float(world_point[0]),
+                    y=float(world_point[1]),
+                    z=float(world_point[2]),
+                    o_x=0.0,
+                    o_y=0.0,
+                    o_z=1.0,
+                    theta=0.0,
+                )
+            )
+
+    rotation, translation = asyncio.run(
+        pick_red_block.camera_world_transform_mm(FakeRobot(), "side-cam")
+    )
+    assert rotation == pytest.approx(rotation_true, abs=1e-6)
+    assert translation == pytest.approx(translation_true, abs=1e-6)
+
+
+def test_no_size_range_keeps_legacy_keepout_height_and_prints_no_tallest_marker(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(pick_red_block, "RESET_SETTLE_S", 0.0)
+    monkeypatch.setattr(pick_red_block, "PLACE_SETTLE_S", 0.0)
+    moves = []
+
+    class World:
+        async def do_command(self, command):
+            if command["command"] == "randomize_props":
+                return {"positions": {"pick_cube": [520.0, 20.0, 30.0]}}
+            return {"geometries": [_block_geometry(520.0, 20.0, 30.0), _pad_geometry()]}
+
+    class Detector:
+        async def block_pose_world(self):
+            return Pose(x=520.0, y=20.0, z=30.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0)
+
+    class Mover:
+        async def look_from(self, pose, world_state):
+            return None
+
+        async def move_to(self, pose, world_state, linear=False):
+            moves.append((pose, world_state, linear))
+
+    class Gripper:
+        async def open(self):
+            return None
+
+        async def grab(self):
+            return True
+
+        async def is_holding_something(self):
+            return True
+
+    pipeline = pick_red_block.PickPipeline(
+        detector=Detector(),
+        mover=Mover(),
+        gripper=Gripper(),
+        block_name="pick_cube",
+        block_size_mm=60.0,
+        gripper_name="pick-grip",
+        world=World(),
+        target_prop_name="pick_cube",
+        movable_prop_names=("pick_cube",),
+        randomize_seed=4,
+        place_prop_name="place_pad",
+    )
+    asyncio.run(pipeline.run())
+
+    out = capsys.readouterr().out
+    assert not any(line.startswith(MEASURED_TALLEST_MARKER) for line in out.splitlines())
+
+    _, carry_state, _ = moves[4]
+    keepout = next(
+        g
+        for frame in carry_state.obstacles
+        for g in frame.geometries
+        if g.label == "pick_area_keepout"
+    )
+    assert keepout.box.dims_mm.z == pick_red_block.KEEPOUT_HEIGHT_MM

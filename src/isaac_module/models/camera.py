@@ -122,6 +122,14 @@ class IsaacCamera(Camera, EasyResource):  # type: ignore[misc]  # SDK: API is Fi
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
         attrs = apply_frame_to_attrs(config, get_attrs(config))
+        # a frame-derived quat is ROS-optical (+Z forward, the frame system's
+        # convention); a legacy orientation_wxyz attr stays world axes
+        if (
+            config.HasField("frame")
+            and config.frame.HasField("orientation")
+            and not attrs.get("parent_prim")
+        ):
+            attrs["orientation_axes"] = "ros"
         self._attrs = attrs
         self._handle = SimManager.get().create_camera(self.name, attrs)
 

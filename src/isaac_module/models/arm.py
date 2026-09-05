@@ -78,8 +78,6 @@ from ..spatial import quat_to_ov
 from .utils import apply_frame_to_attrs, get_attrs, validate_sim_component
 
 _TOLERANCE_RAD = SETTLE_TOL_RAD
-_WAYPOINT_TOLERANCE_RAD = math.radians(2.0)
-_WAYPOINT_DEADLINE_S = 10.0
 
 
 class JointTargetOutOfLimitsError(ViamGRPCError, ValueError):
@@ -333,49 +331,42 @@ class IsaacArm(Arm, EasyResource):  # type: ignore[misc]  # SDK: API is Final on
         deadline."""
         handle = self._h()
         waypoints = list(positions)
+        if not waypoints:
+            return
         max_vel_rad_s = self._max_vel_rad_s(options)
         move_deadline_s = self._deadline_s(timeout)
-        for i, wp in enumerate(waypoints):
+        current = await asyncio.to_thread(handle.get_joint_positions)
+        path: list[list[float]] = []
+        for wp in waypoints:
             targets = [math.radians(v) for v in wp.values]
-            current = await asyncio.to_thread(handle.get_joint_positions)
             if len(current) != len(targets):
                 raise JointTargetOutOfLimitsError(
                     f"arm {self.name}: expected {len(current)} joint values, got {len(targets)}"
                 )
             await self._check_joint_targets(targets)
-            await asyncio.to_thread(handle.set_joint_targets, targets, max_vel_rad_s)
-
-            last = i == len(waypoints) - 1
-            tolerance = _TOLERANCE_RAD if last else _WAYPOINT_TOLERANCE_RAD
-            deadline_s = move_deadline_s if last else _WAYPOINT_DEADLINE_S
-
-            outcome = await asyncio.to_thread(handle.wait_for_settle, deadline_s, tolerance)
-            if outcome is SettleOutcome.REACHED:
-                continue
-
-            current = await asyncio.to_thread(handle.get_joint_positions)
-            detail = _stuck_joint_detail(current, targets, tolerance)
-            if outcome is SettleOutcome.STALLED or last:
-                # hold here rather than keep pushing at the unreachable target
-                await asyncio.to_thread(handle.stop)
-            if outcome is SettleOutcome.STALLED:
-                raise ArmMoveStalledError(
-                    f"arm {self.name} stalled at waypoint {i + 1}/{len(waypoints)} "
-                    f"(stuck joints: {detail})"
-                )
-            # TIMED_OUT
-            if last:
-                raise ArmMoveTimeoutError(
-                    f"arm {self.name} did not reach final waypoint within {deadline_s:.1f}s "
-                    f"(stuck joints: {detail})"
-                )
-            self.logger.warning(
-                "%s: waypoint %d/%d not reached, continuing (%s)",
-                self.name,
-                i + 1,
-                len(waypoints),
-                detail,
+            path.append(targets)
+        # one continuous path, settled once at the end (see ArmHandle.follow_joint_path)
+        await asyncio.to_thread(handle.follow_joint_path, path, max_vel_rad_s)
+        outcome = await asyncio.to_thread(handle.wait_for_settle, move_deadline_s, _TOLERANCE_RAD)
+        if outcome is SettleOutcome.REACHED:
+            return
+        progress = await asyncio.to_thread(handle.path_progress)
+        where = (
+            f"at segment {progress[0] + 1}/{progress[1]}" if progress else "at the final waypoint"
+        )
+        current = await asyncio.to_thread(handle.get_joint_positions)
+        detail = _stuck_joint_detail(current, path[-1], _TOLERANCE_RAD)
+        # hold here rather than keep pushing at the unreachable target
+        await asyncio.to_thread(handle.stop)
+        if outcome is SettleOutcome.STALLED:
+            raise ArmMoveStalledError(
+                f"arm {self.name} stalled {where} of {len(waypoints)} waypoints "
+                f"(stuck joints: {detail})"
             )
+        raise ArmMoveTimeoutError(
+            f"arm {self.name} did not reach the final waypoint within {move_deadline_s:.1f}s "
+            f"({where}; stuck joints: {detail})"
+        )
 
     async def get_joint_positions(self, **kwargs) -> JointPositions:
         radians = await asyncio.to_thread(self._h().get_joint_positions)
@@ -487,6 +478,9 @@ class IsaacArm(Arm, EasyResource):  # type: ignore[misc]  # SDK: API is Final on
                 for entry in state
             ]
             return {"joints": joints}
+        if cmd == "path_trace":
+            trace: list[ValueTypes] = list(await asyncio.to_thread(self._h().path_trace))
+            return {"path_trace": trace}
         if cmd == "prim_world_pose":
             prim_path = command.get("prim_path") or self._default_ee_prim_path()
             if not isinstance(prim_path, str):

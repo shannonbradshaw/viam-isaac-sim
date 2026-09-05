@@ -427,3 +427,111 @@ def test_set_jaw_clears_the_hold_latch():
     handle.set_jaw(0.0)  # open: a new command starts a fresh verdict
     art.positions[6] = math.radians(14.6)
     assert handle.is_holding() is False
+
+
+def test_stop_while_holding_keeps_the_grasp():
+    """isaac-try M0: viam-server calls Stop on the gripper when a session
+    lapses (every CLI `part run` exit). A stop that re-targeted the jaw to
+    its measured angle zeroed the squeeze and cleared the hold."""
+    handle, art = _latched_hold()
+    before = len(art.actions)
+    handle.stop()
+    assert len(art.actions) == before  # no new drive target: the grasp stays
+    assert handle.is_holding() is True
+    assert handle.is_moving() is False
+
+
+def test_stop_mid_travel_freezes_at_the_measured_angle():
+    import math
+
+    handle, art = _jaw_handle()
+    handle.set_jaw(math.radians(47))
+    art.positions[6] = math.radians(20.0)
+    handle.stop()
+    assert art.actions[-1].joint_positions == pytest.approx([math.radians(20.0)])
+    assert handle.is_holding() is False
+
+
+class FakeEffortArticulation(FakeArmArticulation):
+    def __init__(self, dof_names: list[str]) -> None:
+        super().__init__(dof_names)
+        self.efforts = [0.0] * len(dof_names)
+
+    def get_measured_joint_efforts(self, joint_indices=None):
+        indices = joint_indices if joint_indices is not None else range(len(self.efforts))
+        return [self.efforts[i] for i in indices]
+
+
+def _effort_handle(effort_min: float = 0.5):
+    import math
+
+    from isaac_module.sim_manager import IsaacGripperHandle
+
+    art = FakeEffortArticulation(ARM_AND_GRIPPER_DOFS)
+    handle = IsaacGripperHandle(
+        FakeGripperSim(),
+        art,
+        "finger_joint",
+        0.0,
+        math.radians(47),
+        math.radians(2),
+        "/g",
+        holding_effort_min=effort_min,
+    )
+    return handle, art
+
+
+def test_effort_predicate_reports_holding_from_contact_not_the_stall_window():
+    import math
+
+    handle, art = _effort_handle()
+    handle.set_jaw(math.radians(47))
+    art.positions[6] = math.radians(14.6)
+    art.efforts[6] = -1.2  # sign is direction; magnitude counts
+    assert handle.is_holding() is True  # first poll, no stall window needed
+    assert handle.finger_effort() == pytest.approx(1.2)
+    art.efforts[6] = 0.0  # the block slipped out
+    assert handle.is_holding() is False
+
+
+def test_effort_predicate_survives_stop_and_a_cleared_target():
+    import math
+
+    handle, art = _effort_handle()
+    handle.set_jaw(math.radians(47))
+    art.positions[6] = math.radians(14.6)
+    art.efforts[6] = 0.9
+    handle.stop()
+    assert handle.is_holding() is True
+    handle._target = None  # even with no commanded target on record
+    assert handle.is_holding() is True
+
+
+def test_effort_predicate_ignores_fingers_pressing_on_each_other_when_closed():
+    import math
+
+    handle, art = _effort_handle()
+    handle.set_jaw(math.radians(47))
+    art.positions[6] = math.radians(46.5)
+    art.efforts[6] = 3.0  # fully closed on nothing, fingertips touching
+    assert handle.is_holding() is False
+
+
+def test_effort_predicate_falls_back_to_the_stall_window_when_unreadable():
+    """A FakeArmArticulation has no get_measured_joint_efforts: the effort
+    threshold is configured but the stall predicate still decides."""
+    import math
+
+    from isaac_module.sim_manager import GRIPPER_HOLDING_STEPS, IsaacGripperHandle
+
+    art = FakeArmArticulation(ARM_AND_GRIPPER_DOFS)
+    handle = IsaacGripperHandle(
+        FakeGripperSim(), art, "finger_joint", 0.0, math.radians(47), math.radians(2), "/g",
+        holding_effort_min=0.5,
+    )
+    assert handle.finger_effort() is None
+    handle.set_jaw(math.radians(47))
+    art.positions[6] = math.radians(14.6)
+    for _ in range(GRIPPER_HOLDING_STEPS):
+        handle.is_moving()
+    assert handle.is_holding() is True

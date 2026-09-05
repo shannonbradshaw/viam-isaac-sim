@@ -1,4 +1,4 @@
-"""Unit tests for the item runners in examples/gpu_checklist_phase4.py, run
+"""Unit tests for the item runners in examples/gpu_checklist_world.py, run
 against the session-shared mock world (the ``world`` fixture from conftest -
 its SimManager is a singleton, so every prop name here must be unique across
 the whole test suite). Loaded via importlib like the other gpu_checklist
@@ -9,16 +9,16 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_MODULE_PATH = Path(__file__).resolve().parent.parent / "examples" / "gpu_checklist_phase4.py"
-_spec = importlib.util.spec_from_file_location("gpu_checklist_phase4", _MODULE_PATH)
+_MODULE_PATH = Path(__file__).resolve().parent.parent / "examples" / "gpu_checklist_world.py"
+_spec = importlib.util.spec_from_file_location("gpu_checklist_world", _MODULE_PATH)
 assert _spec is not None and _spec.loader is not None
 checklist = importlib.util.module_from_spec(_spec)
-sys.modules["gpu_checklist_phase4"] = checklist
+sys.modules["gpu_checklist_world"] = checklist
 _spec.loader.exec_module(checklist)
 
-ITEM1_PROP = "gpu_checklist_phase4_test_item1_cube"
-ITEM3_PROP = "gpu_checklist_phase4_test_item3_cube"
-SOFT_RESET_PROP = "gpu_checklist_phase4_test_soft_reset_cube"
+ITEM1_PROP = "gpu_checklist_world_test_item1_cube"
+ITEM3_PROP = "gpu_checklist_world_test_item3_cube"
+SOFT_RESET_PROP = "gpu_checklist_world_test_soft_reset_cube"
 
 RANDOMIZE_REGION_MM = ((300.0, -300.0, 50.0), (900.0, 300.0, 50.0))
 SPAWN_POSITION_MM = (500.0, 0.0, 100.0)
@@ -197,7 +197,7 @@ def test_camera_frame_activity_grabs_frames_from_the_mock_camera(world):
 
     camera = IsaacCamera.new(
         ComponentConfig(
-            name="gpu_checklist_phase4_test_cam",
+            name="gpu_checklist_world_test_cam",
             attributes=dict_to_struct(
                 {"world": "sim-world", "width": 64, "height": 48, "depth": True}
             ),

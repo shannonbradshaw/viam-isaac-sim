@@ -21,6 +21,7 @@ from viam.logging import getLogger
 IsaacVersion = tuple[int, int, int]
 
 _LOGGER = getLogger(__name__)
+ASSET_RETRY_MAX_MS = 2000  # omni.client retry budget per URL; the default is 120,000
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
@@ -71,6 +72,18 @@ def import_isaac() -> Any:
         import omni.client
 
         ns.client = omni.client
+        # The 2F-85 asset references part meshes on omniverse://isaac-dev...,
+        # unreachable outside NVIDIA. omni.client retries a failing URL for
+        # max_ms=120,000 by default (measured 2026-09-04: every gripper attach
+        # spent exactly 120 s in that budget, failed viam-server's construction
+        # deadline, and succeeded on the retry). Cap the budget so unresolvable
+        # references fail fast; _rewrite_unresolvable_references re-points them
+        # at the public bucket afterwards.
+        try:
+            previous = omni.client.set_retries(ASSET_RETRY_MAX_MS, 100, 100)
+            _LOGGER.info("omni.client retries capped at %d ms (was %s)", ASSET_RETRY_MAX_MS, previous)
+        except Exception:
+            _LOGGER.exception("could not cap omni.client retries")
     except ImportError:
         ns.client = None
 

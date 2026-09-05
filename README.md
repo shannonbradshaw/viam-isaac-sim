@@ -121,6 +121,7 @@ translation/orientation become the camera's local pose on the link.
 | `boot_timeout_sec` | `300` | Isaac Sim can take a while on first boot |
 | `kit_log_level` | `"warning"` | kit console verbosity |
 | `props` | `[]` | objects spawned into the scene at boot, see below |
+| `oracle_commands` | `true` | serve the ground-truth `DoCommand`s (`prop_geometries`, `spawn_prop`, `set_prop_pose`, `randomize_props`); `false` refuses them, for a cell whose callers must perceive the scene through the cameras |
 | `lighting` | _unset_ | `{"dome": {"intensity": 1000, "color": [1, 1, 1]}, "sphere_intensity": 30000}` - both keys optional, unset leaves the stage's lights alone. The default stage has a single 100 000-intensity sphere light, so a dome light is useful to even out colour for detection |
 | `render` | _unset_ | render-cost levers applied at boot, best-effort: `{"motion_bvh": bool, "disable_viewport_updates": bool}` - both keys optional, unset leaves the renderer's defaults alone. `disable_viewport_updates: true` requires `livestream: false` (the livestream needs viewport updates) and is refused otherwise |
 
@@ -173,9 +174,13 @@ The world also supports `DoCommand`:
 * `{"command": "set_prop_pose", "name": "...", "position": [x,y,z] mm,
   "orientation_rpy_deg"?: [r,p,y] degrees}` - move an existing prop
 * `{"command": "randomize_props", "names": [...], "region": [[x0,y0,z],
-  [x1,y1,z]] mm, "seed": int, "min_separation"?: mm (default 150)}` ->
-  `{"positions": {name: [x,y,z] mm}}` - scatter the named props inside the
-  region (see the worked example below)
+  [x1,y1,z]] mm, "seed": int, "min_separation"?: mm (default 150),
+  "size_range_mm"?: [lo, hi] (applies to every named prop) or
+  {name: [lo, hi]} (keys must be a subset of `names`); cube props only,
+  0 < lo <= hi}` -> `{"positions": {name: [x,y,z] mm}, "sizes_mm":
+  {name: [x,y,z] mm}}` - scatter the named props inside the region,
+  optionally redrawing each ranged prop's size first (see the worked
+  example below)
 * `{"command": "ignore_props", "names": [...]}` -> `{"ignored": [...]}` - an
   empty list clears the exclusion. Excludes the named props from
   `GetGeometries` (e.g. the block currently being grasped)
@@ -293,6 +298,7 @@ component this gripper is bolted to).
 | `closed_deg` | `47` on Isaac 5.0, `45` on 4.5 | drive-joint angle when fully closed (the Isaac-release value from `compat.caps()`) |
 | `grab_timeout_sec` | `5` | how long `grab()` waits for a stall or full closure |
 | `holding_tolerance_deg` | `2` | commanded-vs-measured gap that counts as holding |
+| `holding_effort_min_nm` | _unset_ | Isaac only: measured drive-joint effort (N m) at which the jaw counts as holding; unset = the stall check below |
 | `mock_object_width_m` | _unset_ | mock only: width of the object between the jaws (unset = nothing to grab, so `grab()` returns `false`) |
 
 **Frame** - unlike a mounted camera, the gripper's frame does not place its
@@ -310,10 +316,22 @@ link frame's **+Z**, so gripper and wrist-camera `frame.translation` offsets
 off an arm link both go along +Z.
 
 **API mapping** (viam-sdk `Gripper`, all eight abstract methods): `open` /
-`stop` / `is_moving` drive the handle directly. `grab()` closes the jaw,
-waits up to `grab_timeout_sec` for a stall or full closure, and returns
-`is_holding_something()` - both are stall-short-of-closure checks, not a
-force sensor. `get_current_inputs()` / `go_to_inputs([v])` use a single
+`is_moving` drive the handle directly. `stop` freezes the jaw, and while an
+object is held it keeps the grasp (the commanded target stays) rather than
+relaxing the drive: viam-server calls `Stop` on every actuator a session
+commanded once that session lapses, so a one-shot client such as the CLI's
+`part run` would otherwise drop the object two seconds after exiting.
+`grab()` closes the jaw, waits up to `grab_timeout_sec` for a stall or full
+closure, and returns `is_holding_something()`. By default both are
+stall-short-of-closure checks, not a force sensor; with
+`holding_effort_min_nm` set (and an Isaac build that reports measured joint
+efforts) holding means the drive is pushing at least that hard with the jaw
+short of fully closed, and `is_holding_something()` reports the effort as
+`finger_effort_nm` in its metadata. Measured on Isaac 5.0 with the 2F-85 and
+the pick cell's 60 mm, 50 g cube (2026-09-04): open and idle 0.04-0.06 N m,
+closed on nothing 0.004-0.008, closed on the cube resting on the table 0.25,
+the same grasp lifted 4.0, unchanged after `stop`. The pick cell sets
+`holding_effort_min_nm` to `0.15`. `get_current_inputs()` / `go_to_inputs([v])` use a single
 value in `[0, 1]`: `0` = open, `1` = closed. `GetKinematics` returns a
 1-link/0-joint SVA whose link is the 36 × 146 × 153 mm gripper box (flange to fingertips, centre 57.5 mm behind the
 TCP. `GetGeometries` returns that same single box.
@@ -333,7 +351,7 @@ prim.
 **Runtime attributes** re-apply live without a restart: `world`,
 `move_timeout_sec`, `max_linear_mps`, `max_angular_rps`, `arm`,
 `tcp_offset_m`, `open_deg`, `closed_deg`, `grab_timeout_sec`,
-`holding_tolerance_deg`, `mock_object_width_m`.
+`holding_tolerance_deg`, `holding_effort_min_nm`, `mock_object_width_m`.
 
 ### camera attributes
 
@@ -358,9 +376,13 @@ one.
 | `clip_near` | `0.05` | metres, near clip plane |
 | `clip_far` | `10.0` | metres, far clip plane |
 | `image_format` | `"png"` | colour encoding for `GetImages` (`"png"` or `"jpeg"`) |
+| `block_size_mm` | _unset_ | mock backend only: metric edge of the fabricated red block; unset keeps the fixed pixel-offset block |
+| `view` | `"top"` | mock backend only: `"side"` fabricates a profile scene of the `blocks` list rising from the support line at the principal row |
+| `blocks` | _unset_ | mock backend only, side view: list of `{rgb, size_mm, height_mm, column_offset_px, depth_m}` fabricated blocks |
 | `frequency` | _unset_ | capture rate, unset = every rendered frame |
 | `parent_prim` | _unset_ | ride a link (e.g. a wrist camera) instead of spawning free-standing, requires a `frame` whose `parent` is the component that owns that prim (see "Frames" above) - its translation/orientation become the camera's local pose, applied in ROS-optical axes (camera +Z = frame +Z). The legacy `local_position`/`local_orientation_rpy_deg` attributes only apply when no `frame` is set |
 | `annotator_device` | _unset_ | GPU-resident annotator data path, e.g. `"cuda"`, applied on Isaac Sim 5.0+, logged and ignored on 4.5 |
+| `orientation_axes` | `"world"` | convention of `orientation_wxyz` for a free-standing camera: `"world"` (+X forward) for the legacy attr, `"ros"` (+Z forward) set automatically when the quat comes from a Viam `frame` orientation - don't set it by hand |
 
 **What the camera serves:** `GetImages` returns `[NamedImage("color", png|jpeg),
 NamedImage("depth", image/vnd.viam.dep)]`, colour first, honouring
@@ -407,10 +429,12 @@ A wrist camera riding an arm link:
 The `isaac-sim-pick-and-place` fragment (source in
 `fragments/pick-and-place.json`) is a ready-made work cell: a UR5e
 (`pick-arm`) mounted at the corner of a 0.75 m table, a `pick-grip`
-gripper, a red 6 cm cube (`pick_cube`) plus two distractor cubes
-(`ignore_cube_green`, `ignore_cube_blue`), a `place_pad` to set the block
+gripper, a red 6 cm cube (`pick_cube`) plus five distractor cubes
+(`ignore_cube_green`, `ignore_cube_blue`, `ignore_cube_yellow`,
+`ignore_cube_purple`, `ignore_cube_orange`), a `place_pad` to set the block
 down on, a `wrist-cam` riding the arm's flange, a `scene-cam` watching the
-whole workspace, the `builtin` motion service, and the `red-detector` /
+whole workspace, a fixed `side-cam` looking across the table for tallest-block
+measurement, the `builtin` motion service, and the `red-detector` /
 `block-segmenter` vision services that find the block. Add the fragment to
 any machine that meets the requirements above and the world spawns
 everything at boot.
@@ -418,7 +442,7 @@ everything at boot.
 Props are configured on the world with the `props` attribute (cubes or USD
 references, fixed or dynamic) - see the fragment for the shape of it.
 
-The fragment ships five `$variable`s, each with a `default_value` equal to
+The fragment ships nine `$variable`s, each with a `default_value` equal to
 the numbers below, so a machine that sets nothing boots the exact cell:
 
 | variable | binds | default |
@@ -427,13 +451,17 @@ the numbers below, so a machine that sets nothing boots the exact cell:
 | `pick-block-color` | `pick_cube.color` | `[0.9, 0.1, 0.1]` |
 | `distractor-color-green` | `ignore_cube_green.color` | `[0.05, 0.65, 0.1]` |
 | `distractor-color-blue` | `ignore_cube_blue.color` | `[0.05, 0.1, 0.9]` |
+| `distractor-color-yellow` | `ignore_cube_yellow.color` | `[0.9, 0.75, 0.05]` |
+| `distractor-color-purple` | `ignore_cube_purple.color` | `[0.55, 0.1, 0.75]` |
+| `distractor-color-orange` | `ignore_cube_orange.color` | `[1.0, 0.55, 0.05]` |
 | `detect-color` | `red-detector`'s `detect_color` | `"#EA8D8D"` |
+| `hue-tolerance-pct` | `red-detector`'s `hue_tolerance_pct` | `0.05` |
 
 `table-height-m` only substitutes the table prop's `scale[2]`: it has no
 arithmetic, so overriding it desyncs every other number derived from the
 table height - the table's own `position[2]` (`h / 2`), `sim-world`'s
 `frame.geometry` z (`h - 0.01` m, box centred at `(h - 0.01) / 2`), the
-three blocks' and `place_pad`'s z, and `pick-arm`'s frame z (`h` in mm).
+six blocks' and `place_pad`'s z, and `pick-arm`'s frame z (`h` in mm).
 Override the table height only via `fragment_mods` `$set` overrides on
 those other fields too, kept in sync by hand.
 
@@ -456,8 +484,58 @@ PYTHONPATH=src python examples/pick_red_block.py \
 not the floor. The table is already a planner obstacle - the world serves
 every prop geometry live - so `--table` (the recipe box for scenes that
 serve none) is unnecessary and is dropped automatically when a live
-`table` box is present. Add `--randomize-seed <n>` to scatter the three
+`table` box is present. Add `--randomize-seed <n>` to scatter the six
 blocks deterministically first (see "Randomizing props" below).
+
+`--block-size-mm` is optional: omit it (the default) and the script measures
+the target's size itself, from the focused detection's point cloud -
+footprint (x/y extents) and height (top face minus the support), cross-checked
+against each other, printed as `MEASURED_BLOCK_JSON={"footprint_mm": [x, y],
+"height_mm": h, "size_mm": s, "scan_pose_mm": {...}}`. A view where the three
+readings disagree is treated as degenerate and re-scanned rather than grasped
+on. A measured size wider than the gripper's jaw (75 mm - the 2F-85's 85 mm
+opening minus finger clearance) refuses the grasp cleanly instead of
+attempting a doomed pick. Pass `--block-size-mm <mm>` to skip measurement
+and use a fixed size end to end, as before.
+
+Combine `--randomize-seed <n>` with `--randomize-size-mm <lo>,<hi>` to also
+redraw each scattered block's size (see "Randomizing props" below); the
+script warns, without failing, if the measured size falls outside that range.
+
+### Measuring the tallest block (dynamic carry heights)
+
+With sizes randomized, a fixed constant no longer bounds how high the arm
+must lift the held block to clear the scattered ones, so the script measures
+the tallest object in the scatter region before picking. The primary sensor
+is `side-cam`, a fixed camera looking across the table: frame-oriented (no
+arm motion needed) and occlusion-proof for the max height, except when a
+nearer block's silhouette covers a farther, taller one. Each candidate
+measurement runs four trust checks - enough in-region points above the
+support plane, a size-range-plausible result, enough points near the
+measured top (no lone stray point), and all four footprint quadrants
+covered - and only a measurement that passes all four is used. When the side
+scan fails trust (or `--tallest-camera` disables it), the wrist camera sweeps
+region-corner vantages as a fallback; if that also fails, the
+`--randomize-size-mm` range's upper bound is used as a conservative ceiling,
+with a logged warning. GPU runs validated the side scan within 0.8 mm of the
+drawn (ground-truth) size and the wrist sweep within 0.1 mm.
+
+When `--randomize-size-mm` is on, the measured tallest height replaces the
+legacy fixed 130 mm keep-out ceiling and 200 mm carry-hop height (both
+60 mm-block constants) with heights derived from the measurement; without
+`--randomize-size-mm`, the script keeps using those fixed constants.
+`--tallest-camera` (default `side-cam`) names the camera component to use as
+the primary sensor; pass an empty string to disable it and go straight to
+the wrist sweep.
+
+The script prints `MEASURED_TALLEST_JSON={"tallest_mm": 81.06, "source":
+"side", "trusted": true, "reasons": [], "points": 1842, "scan_poses_mm": [],
+"keepout_height_mm": 148.3, "carry_clear_above_support_mm": 231.6,
+"drawn_tallest_mm": 81.06, "drawn_delta_mm": 0.0}`. `source` is `"side"`,
+`"wrist_sweep"`, or `"fallback"`. `drawn_tallest_mm`/`drawn_delta_mm` are
+log-only evidence from the randomize response's ground-truth sizes (null
+without a sizes-bearing randomize response) - the pipeline never reads sim
+ground truth to make a decision, only the client-side measurement does.
 
 ### Props and obstacles
 
@@ -527,9 +605,10 @@ plans around them depends on which of three routes you take:
 `{"command": "randomize_props", ...}` scatters named props to random
 positions inside a region, deterministically: the same `seed` always
 produces the same layout. Positions are kept at least `min_separation` mm
-apart (default 150 mm). A worked example scattering the fragment's three
-blocks across the table top (1200 x 800 mm, centred at (600, 0, 370) mm, so
-the top face is at z = 740 mm):
+apart, or the two props' edge-to-edge gap if that is larger for props with
+known sizes (default `min_separation` 150 mm). A worked example scattering
+three of the fragment's six blocks across the table top (1200 x 800 mm, centred at
+(600, 0, 370) mm, so the top face is at z = 740 mm):
 
 ```json
 {
@@ -540,9 +619,26 @@ the top face is at z = 740 mm):
 }
 ```
 
--> `{"positions": {"pick_cube": [x, y, 740], "ignore_cube_green": [x, y, 740],
-"ignore_cube_blue": [x, y, 740]}}` with the same `x`/`y` values every time
-`seed: 42` is passed for this region and these names.
+-> `{"positions": {"pick_cube": [x, y, 770.5], "ignore_cube_green": [x, y, 770.5],
+"ignore_cube_blue": [x, y, 770.5]}, "sizes_mm": {"pick_cube": [x, y, z], ...}}`
+(centre z = face z + half the 60 mm block + a 0.5 mm rest gap) with the same
+`x`/`y` values every time `seed: 42` is passed for this region
+and these names. `sizes_mm` is always present: each named prop's current
+box dims, in millimetres.
+
+Adding `"size_range_mm": [30, 90]` (or `{"pick_cube": [30, 90]}` to target
+specific props) redraws a fresh size for each ranged cube prop before
+placing it - one uniform draw per prop, in millimetres, applied to all
+three axes - from the same seeded stream as the positions, so `seed: 42`
+reproduces both the sizes and the positions. The prop's `size` config
+attribute stays the spawn baseline: rescaling is always relative to it, so
+repeated `randomize_props` calls with different ranges never compound.
+
+A sized call also resets the world before the teleports, the same way
+`spawn_prop` does: rescaling a live rigid body invalidates PhysX's cooked
+state, so every prop snaps to its spawn pose and the post-reset hooks fire,
+and then the named props teleport to their sampled positions. A call
+without `size_range_mm` never resets.
 
 ### Arm mount recipe
 

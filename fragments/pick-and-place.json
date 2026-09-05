@@ -95,6 +95,54 @@
             "contact_offset": 0.005
           },
           {
+            "name": "ignore_cube_yellow",
+            "type": "cube",
+            "position": [0.62, -0.35, 0.7805],
+            "size": 0.06,
+            "color": {
+              "$variable": {
+                "name": "distractor-color-yellow",
+                "default_value": [0.9, 0.75, 0.05]
+              }
+            },
+            "mass": 0.05,
+            "friction": 0.7,
+            "restitution": 0,
+            "contact_offset": 0.005
+          },
+          {
+            "name": "ignore_cube_purple",
+            "type": "cube",
+            "position": [0.45, 0.33, 0.7805],
+            "size": 0.06,
+            "color": {
+              "$variable": {
+                "name": "distractor-color-purple",
+                "default_value": [0.55, 0.1, 0.75]
+              }
+            },
+            "mass": 0.05,
+            "friction": 0.7,
+            "restitution": 0,
+            "contact_offset": 0.005
+          },
+          {
+            "name": "ignore_cube_orange",
+            "type": "cube",
+            "position": [0.25, 0.08, 0.7805],
+            "size": 0.06,
+            "color": {
+              "$variable": {
+                "name": "distractor-color-orange",
+                "default_value": [1.0, 0.55, 0.05]
+              }
+            },
+            "mass": 0.05,
+            "friction": 0.7,
+            "restitution": 0,
+            "contact_offset": 0.005
+          },
+          {
             "name": "place_pad",
             "type": "cube",
             "fixed": true,
@@ -104,6 +152,18 @@
             "color": [0.85, 0.75, 0.1],
             "friction": 0.7,
             "restitution": 0
+          },
+          {
+            "name": "side_cam_body",
+            "type": "cube",
+            "fixed": true,
+            "size": 1.0,
+            "scale": [0.09, 0.025, 0.025],
+            "position": [0.575, 0.665, 0.9],
+            "color": [0.2, 0.2, 0.2],
+            "friction": 0.7,
+            "restitution": 0,
+            "contact_offset": 0.005
           }
         ],
         "lighting": {
@@ -157,6 +217,32 @@
       }
     },
     {
+      "name": "side-cam",
+      "api": "rdk:component:camera",
+      "model": "viam:isaac-sim-devin:camera",
+      "frame": {
+        "parent": "world",
+        "translation": { "x": 575, "y": 650, "z": 900 },
+        "orientation": {
+          "type": "ov_degrees",
+          "value": { "x": 0, "y": -650, "z": -150, "th": 0 }
+        },
+        "geometry": {
+          "type": "box",
+          "x": 90,
+          "y": 25,
+          "z": 25
+        }
+      },
+      "attributes": {
+        "world": "sim-world",
+        "depth": true,
+        "width": 848,
+        "height": 480,
+        "fov_deg": 90.5
+      }
+    },
+    {
       "name": "wrist-cam",
       "api": "rdk:component:camera",
       "model": "viam:isaac-sim-devin:camera",
@@ -166,6 +252,12 @@
         "orientation": {
           "type": "ov_degrees",
           "value": { "x": 0, "y": 0, "z": 1, "th": 180 }
+        },
+        "geometry": {
+          "type": "box",
+          "x": 90,
+          "y": 25,
+          "z": 25
         }
       },
       "attributes": {
@@ -188,7 +280,9 @@
           "$variable": { "name": "detect-color", "default_value": "#EA8D8D" }
         },
         "camera_name": "wrist-cam",
-        "hue_tolerance_pct": 0.1,
+        "hue_tolerance_pct": {
+          "$variable": { "name": "hue-tolerance-pct", "default_value": 0.05 }
+        },
         "segment_size_px": 100,
         "value_cutoff_pct": 0.15
       }

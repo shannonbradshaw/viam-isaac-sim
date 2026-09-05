@@ -1,4 +1,4 @@
-"""Unit tests for the pure helpers in examples/gpu_checklist_phase1.py.
+"""Unit tests for the pure helpers in examples/gpu_checklist_arm.py.
 
 The module lives under examples/ (not a package under src/) and must not be
 imported by anything in src/isaac_module (it runs on a laptop against a
@@ -13,17 +13,17 @@ from pathlib import Path
 
 import pytest
 
-_MODULE_PATH = Path(__file__).resolve().parent.parent / "examples" / "gpu_checklist_phase1.py"
-_spec = importlib.util.spec_from_file_location("gpu_checklist_phase1", _MODULE_PATH)
+_MODULE_PATH = Path(__file__).resolve().parent.parent / "examples" / "gpu_checklist_arm.py"
+_spec = importlib.util.spec_from_file_location("gpu_checklist_arm", _MODULE_PATH)
 assert _spec is not None and _spec.loader is not None
-gpu_checklist_phase1 = importlib.util.module_from_spec(_spec)
-sys.modules["gpu_checklist_phase1"] = gpu_checklist_phase1
-_spec.loader.exec_module(gpu_checklist_phase1)
+gpu_checklist_arm = importlib.util.module_from_spec(_spec)
+sys.modules["gpu_checklist_arm"] = gpu_checklist_arm
+_spec.loader.exec_module(gpu_checklist_arm)
 
-pose_delta_mm_deg = gpu_checklist_phase1.pose_delta_mm_deg
-axis_from_quaternion = gpu_checklist_phase1.axis_from_quaternion
-angle_between_deg = gpu_checklist_phase1.angle_between_deg
-verdict = gpu_checklist_phase1.verdict
+pose_delta_mm_deg = gpu_checklist_arm.pose_delta_mm_deg
+axis_from_quaternion = gpu_checklist_arm.axis_from_quaternion
+angle_between_deg = gpu_checklist_arm.angle_between_deg
+verdict = gpu_checklist_arm.verdict
 
 
 def test_pose_delta_identical_poses_is_zero():

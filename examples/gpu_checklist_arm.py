@@ -11,7 +11,7 @@ remote machine, not inside the module process.
 
 Usage::
 
-    python examples/gpu_checklist_phase1.py --address <machine-address> \\
+    python examples/gpu_checklist_arm.py --address <machine-address> \\
         --api-key <key> --api-key-id <key-id>
 """
 
@@ -28,7 +28,7 @@ from viam.robot.client import RobotClient
 from viam.services.motion import MotionClient
 
 # ----------------------------------------------------------------------
-# pure helpers - unit-testable without a robot (see tests/test_gpu_checklist.py)
+# pure helpers - unit-testable without a robot (see tests/test_gpu_checklist_arm.py)
 # ----------------------------------------------------------------------
 
 PoseTuple = tuple[float, float, float, float, float, float, float]

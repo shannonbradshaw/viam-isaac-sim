@@ -15,6 +15,8 @@ Attributes:
                                     (47 on 5.0, 45 on 4.5 - R-9)
   grab_timeout_sec (float)        - how long grab() waits for a stall or full closure, default 5
   holding_tolerance_deg (float)   - commanded-vs-measured gap that counts as holding, default 2
+  holding_effort_min_nm (float)   - Isaac only: measured drive effort (N m) at which the jaw counts
+                                    as holding; unset = the stall predicate
   mock_object_width_m (float)     - mock only: width of the object between the jaws
                                     (unset = nothing to grab, so grab() returns False)
 
@@ -79,6 +81,10 @@ DEFAULT_TCP_OFFSET_M = float(KNOWN_ASSETS[DEFAULT_GRIPPER_ASSET]["tcp_offset_m"]
 DEFAULT_GRAB_TIMEOUT_S = 5.0
 GRAB_POLL_INTERVAL_S = 1.0 / 120.0  # matches MockArmHandle.STEP_S; the sim's "physics step"
 JAW_CLOSED_TOLERANCE_RAD = 1e-3
+GRAB_REGRIPS = 3  # extra attempts when the jaw stalls short of closed without holding: nudge, back off + close, nudge
+GRAB_REGRIP_BACKOFF_RAD = math.radians(8.0)
+GRAB_NUDGE_RAD = math.radians(5.0)
+GRAB_JAM_STILL_S = 0.25  # still and short of closed this long without holding = jammed
 JAW_BOX_MM: tuple[float, float, float] = KNOWN_ASSETS[DEFAULT_GRIPPER_ASSET]["jaw_box_mm"]
 # The box spans flange -> fingertips; in the gripper frame (origin = TCP) its
 # centre sits reach/2 - tcp behind the TCP (measured: 76.5 - 134 = -57.5 mm).
@@ -195,40 +201,76 @@ class IsaacGripper(Gripper, EasyResource):  # type: ignore[misc]  # SDK: API is 
         await asyncio.to_thread(self._h().open)
 
     async def grab(self, **kwargs) -> bool:
+        """Close, and if the jaw stalls short of closed without holding (the
+        2F-85 linkage jams in a low-force state on about half of otherwise
+        identical closes: jaw 13.2-13.5 deg at 0.017 N m against 14.7 deg at
+        2.4+ when it bites, measured 2026-09-04), back the jaw off a few
+        degrees and close again, up to GRAB_REGRIPS times, all within
+        grab_timeout_sec. A real gripper controller regrips the same way."""
         handle = self._h()
-        await asyncio.to_thread(handle.close)
-
         deadline = time.monotonic() + self._grab_timeout
+        _, closed_rad = await asyncio.to_thread(handle.jaw_limits)
+        for attempt in range(GRAB_REGRIPS + 1):
+            if attempt > 0:
+                jaw = await asyncio.to_thread(handle.get_jaw)
+                effort = await asyncio.to_thread(handle.finger_effort)
+                self.logger.info(
+                    "gripper %s: jaw stalled at %.1f deg without holding (effort %s); regrip %d/%d",
+                    self.name, math.degrees(jaw), None if effort is None else round(effort, 3),
+                    attempt, GRAB_REGRIPS,
+                )
+                if attempt % 2 == 1:
+                    # nudge: a target a few degrees past the jam breaks it where a
+                    # full close did not (an agent proved it: 11 deg jammed at no
+                    # effort, commanded 16 deg, stalled at 15.9 deg with 5.8 N m)
+                    await asyncio.to_thread(handle.set_jaw, jaw + GRAB_NUDGE_RAD)
+                    await self._wait_still(handle, deadline)
+                    if await asyncio.to_thread(handle.is_holding):
+                        return True
+                    continue
+                await asyncio.to_thread(handle.set_jaw, jaw - GRAB_REGRIP_BACKOFF_RAD)
+                await self._wait_still(handle, deadline)
+            await asyncio.to_thread(handle.close)
+            await self._wait_still(handle, deadline)
+            still_since: float | None = None
+            while time.monotonic() < deadline:
+                if await asyncio.to_thread(handle.is_holding):
+                    return True
+                jaw = await asyncio.to_thread(handle.get_jaw)
+                if abs(jaw - closed_rad) <= JAW_CLOSED_TOLERANCE_RAD:
+                    return await asyncio.to_thread(handle.is_holding)  # fully closed: nothing there
+                if await asyncio.to_thread(handle.is_moving):
+                    still_since = None
+                else:
+                    still_since = still_since or time.monotonic()
+                    if time.monotonic() - still_since >= GRAB_JAM_STILL_S:
+                        break  # still, short of closed, not holding: jammed, regrip
+                await asyncio.sleep(GRAB_POLL_INTERVAL_S)
+            if time.monotonic() >= deadline:
+                break
+        return await asyncio.to_thread(handle.is_holding)
+
+    async def _wait_still(self, handle: GripperHandle, deadline: float) -> None:
         while time.monotonic() < deadline and await asyncio.to_thread(handle.is_moving):
             await asyncio.sleep(GRAB_POLL_INTERVAL_S)
-
-        _, closed_rad = await asyncio.to_thread(handle.jaw_limits)
-        while time.monotonic() < deadline:
-            if await asyncio.to_thread(handle.is_holding):
-                return True
-            jaw = await asyncio.to_thread(handle.get_jaw)
-            if abs(jaw - closed_rad) <= JAW_CLOSED_TOLERANCE_RAD:
-                break
-            await asyncio.sleep(GRAB_POLL_INTERVAL_S)
-
-        return await asyncio.to_thread(handle.is_holding)
 
     async def is_holding_something(self, **kwargs) -> Gripper.HoldingStatus:
         handle = self._h()
         open_rad, closed_rad = await asyncio.to_thread(handle.jaw_limits)
         jaw_rad = await asyncio.to_thread(handle.get_jaw)
         is_holding = await asyncio.to_thread(handle.is_holding)
+        effort = await asyncio.to_thread(handle.finger_effort)
         span = closed_rad - open_rad
         input_value = (jaw_rad - open_rad) / span if span else 0.0
-        return Gripper.HoldingStatus(
-            is_holding_something=is_holding,
-            meta={
-                "jaw_deg": math.degrees(jaw_rad),
-                "open_deg": math.degrees(open_rad),
-                "closed_deg": math.degrees(closed_rad),
-                "input": min(max(input_value, 0.0), 1.0),
-            },
-        )
+        meta: dict[str, ValueTypes] = {
+            "jaw_deg": math.degrees(jaw_rad),
+            "open_deg": math.degrees(open_rad),
+            "closed_deg": math.degrees(closed_rad),
+            "input": min(max(input_value, 0.0), 1.0),
+        }
+        if effort is not None:
+            meta["finger_effort_nm"] = effort
+        return Gripper.HoldingStatus(is_holding_something=is_holding, meta=meta)
 
     async def stop(self, **kwargs) -> None:
         await asyncio.to_thread(self._h().stop)
@@ -308,6 +350,15 @@ class IsaacGripper(Gripper, EasyResource):  # type: ignore[misc]  # SDK: API is 
             }
         if cmd == "tcp_pose":
             return await asyncio.to_thread(self._tcp_pose)
+        if cmd == "contacts":
+            contacts: list[ValueTypes] = list(await asyncio.to_thread(self._h().contacts))
+            return {"contacts": contacts}
+        if cmd == "collision_shapes":
+            prim = command.get("prim")
+            shapes: list[ValueTypes] = list(
+                await asyncio.to_thread(self._h().collision_shapes, str(prim) if prim else None)
+            )
+            return {"collision_shapes": shapes}
         raise ValueError(f"unknown command: {command}")
 
     def _tcp_pose(self) -> dict[str, ValueTypes]:

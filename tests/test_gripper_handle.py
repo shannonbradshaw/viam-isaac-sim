@@ -122,3 +122,24 @@ def test_mock_arm_speed_constant_used_by_gripper_interpolation():
     # sanity: the gripper's interpolation speed comes from the same constant
     # the arm mock uses (FINDINGS ARM-2's shared-pattern requirement).
     assert MockArmHandle.SPEED == 1.0
+
+
+def test_stop_while_holding_keeps_holding(sim):
+    """A session-end Stop must not relax a grasp (see IsaacGripperHandle.stop)."""
+    sim.create_arm("gripper-arm-hold", {"world": "sim-world", "asset": "ur5e"})
+    gripper = sim.create_gripper(
+        "gripper-hold",
+        {"world": "sim-world", "arm": "gripper-arm-hold", "mock_object_width_m": 0.05},
+    )
+    gripper.close()
+    assert _wait_until(lambda: not gripper.is_moving())
+    assert _wait_until(gripper.is_holding)
+    jaw_before = gripper.get_jaw()
+
+    gripper.stop()
+
+    assert gripper.is_holding() is True
+    assert gripper.get_jaw() == pytest.approx(jaw_before, abs=1e-6)
+    assert gripper.finger_effort() is None  # the mock has no effort to report
+    gripper.open()
+    assert gripper.is_holding() is False

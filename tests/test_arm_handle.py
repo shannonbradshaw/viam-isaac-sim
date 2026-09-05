@@ -319,11 +319,12 @@ def test_isaac_settle_times_out_while_still_converging():
     assert not sim.world.physics_callback_exists(callback_name)
 
 
-def test_isaac_arm_post_reset_reapplies_solver_gains_and_targets():
+def test_isaac_arm_post_reset_reapplies_solver_gains_and_holds_the_reset_pose():
     handle, art, sim = _make_handle()
     handle._solver_iterations = 64
     handle._gains = ([2.0, 2.0], [3.0, 3.0])
-    handle._targets = [0.4, 0.5]
+    handle._targets = [0.4, 0.5]  # pre-reset targets: NOT re-commanded (see post_reset)
+    art.positions = [0.1, 0.2]  # where the reset put the joints
 
     handle.post_reset()
 
@@ -331,7 +332,8 @@ def test_isaac_arm_post_reset_reapplies_solver_gains_and_targets():
     assert art._controller.set_gains_calls == [([2.0, 2.0], [3.0, 3.0])]
     assert art.applied_actions
     last = art.applied_actions[-1]
-    assert list(last.joint_positions) == [0.4, 0.5]
+    assert list(last.joint_positions) == pytest.approx([0.1, 0.2])
+    assert handle._targets == pytest.approx([0.1, 0.2])
 
 
 def test_isaac_arm_release_removes_settle_callback_and_registry_entry():
@@ -437,3 +439,171 @@ def test_isaac_settle_stalls_on_no_progress_even_while_vibrating():
     thread.join(timeout=2.0)
 
     assert result["outcome"] == SettleOutcome.STALLED
+
+
+
+# ---- time-synchronized joint interpolation (set_joint_targets) ----------------
+
+
+def _interp_step(sim, art):
+    return sim.world._callbacks[f"{art.name}_interp"]
+
+
+def test_set_joint_targets_moves_all_joints_along_a_straight_line_together():
+    """A planner validates the straight joint-space segment between two
+    waypoints. Handing PhysX the final targets let each joint run at its own
+    speed, so the executed path was an arc that swept the fingertips through
+    the block (2026-09-04). Every joint must reach its goal on the same step."""
+    handle, art, sim = _make_handle()
+    handle.set_joint_targets([1.0, 0.1], max_vel_rad_s=1.0)  # 1 s at 1 rad/s for the long joint
+    assert art.applied_actions[-1].joint_positions.tolist() == [0.0, 0.0]  # starts where it is
+    step = _interp_step(sim, art)
+    for k in range(1, 5):
+        step(0.25)
+        assert art.applied_actions[-1].joint_positions.tolist() == pytest.approx([0.25 * k, 0.025 * k])
+    assert handle._interp is None  # arrived: no further targets
+    n = len(art.applied_actions)
+    step(0.25)
+    assert len(art.applied_actions) == n
+
+
+def test_set_joint_targets_uses_sync_speed_when_the_move_sets_no_cap():
+    import math
+
+    from isaac_module.sim_manager import SYNC_JOINT_VEL_RAD_S
+
+    handle, art, sim = _make_handle()
+    handle.set_joint_targets([math.radians(60.0), 0.0])
+    assert handle._interp["segments"][0]["duration"] == pytest.approx(
+        math.radians(60.0) / SYNC_JOINT_VEL_RAD_S
+    )
+
+
+def test_tiny_moves_are_still_interpolated_and_finish_in_one_step():
+    """Even a 0.06 deg move is a segment (dropping small travels collapsed
+    dense linear plans into a jump); it finishes on the first step."""
+    handle, art, sim = _make_handle()
+    handle.set_joint_targets([0.001, 0.0], max_vel_rad_s=1.0)
+    assert handle._interp is not None and len(handle._interp["segments"]) == 1
+    _interp_step(sim, art)(0.01)
+    assert handle._interp is None
+    assert art.applied_actions[-1].joint_positions.tolist() == pytest.approx([0.001, 0.0])
+
+
+def test_stop_drops_the_in_flight_interpolation_and_holds():
+    handle, art, sim = _make_handle()
+    handle.set_joint_targets([1.0, 0.0], max_vel_rad_s=1.0)
+    step = _interp_step(sim, art)
+    step(0.5)
+    assert art.positions[0] == pytest.approx(0.5)
+    handle.stop()
+    assert handle._interp is None
+    assert handle._targets == pytest.approx([0.5, 0.0])
+    n = len(art.applied_actions)
+    step(0.5)
+    assert len(art.applied_actions) == n  # nothing keeps driving toward the old goal
+
+
+
+def test_post_reset_holds_the_reset_pose_not_the_old_targets():
+    """A world.reset() teleports the arm to its default pose and props to
+    their spawn poses. Re-commanding the pre-reset targets drove the arm back
+    through the freshly placed block (2026-09-04); it must hold where it is."""
+    handle, art, sim = _make_handle()
+    handle.set_joint_targets([1.0, 0.5], max_vel_rad_s=100.0)
+    art.positions = [0.0, 0.0]  # the reset put the joints back at their defaults
+    handle.post_reset()
+    assert handle._targets == pytest.approx([0.0, 0.0])
+    assert art.applied_actions[-1].joint_positions.tolist() == pytest.approx([0.0, 0.0])
+    assert handle._interp is None
+
+
+
+def test_follow_joint_path_runs_through_every_waypoint_without_settling():
+    """A plan executes as one continuous path: each segment is a synchronized
+    straight line, the next starts the step the previous ends, and only the
+    final waypoint is the settle target."""
+    handle, art, sim = _make_handle()
+    handle.follow_joint_path([[1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], max_vel_rad_s=1.0)
+    assert handle._targets == pytest.approx([0.0, 1.0])
+    assert handle.path_progress() == (0, 3)
+    step = _interp_step(sim, art)
+    seen = []
+    for _ in range(12):
+        step(0.25)
+        seen.append(tuple(round(v, 3) for v in art.applied_actions[-1].joint_positions.tolist()))
+    assert (1.0, 0.0) in seen and (1.0, 1.0) in seen and (0.0, 1.0) in seen
+    assert seen.index((1.0, 0.0)) < seen.index((1.0, 1.0)) < seen.index((0.0, 1.0))
+    assert handle._interp is None and handle.path_progress() is None
+
+
+def test_path_pauses_while_the_arm_lags_and_flags_a_stall():
+    """Contact: the drives cannot follow. The commanded target must not run
+    ahead, and a lag that outlasts STALL_NO_PROGRESS_STEPS is a stall."""
+    from isaac_module.sim_manager import STALL_NO_PROGRESS_STEPS
+
+    handle, art, sim = _make_handle()
+    art.apply_action = lambda action: art.applied_actions.append(action)  # joints never move
+    handle.follow_joint_path([[1.0, 0.0]], max_vel_rad_s=1.0)
+    step = _interp_step(sim, art)
+    for _ in range(5):
+        step(0.1)
+    commanded = art.applied_actions[-1].joint_positions.tolist()
+    assert commanded[0] <= 0.1 + 1e-9  # one step at most: the target stopped once the arm fell behind
+    # once the arm catches up to within the tolerance, the path advances again
+    art.positions[0] = commanded[0] - 0.005
+    step(0.1)
+    assert art.applied_actions[-1].joint_positions[0] > commanded[0]
+    assert handle._interp["stalled"] is False and handle._interp["lag_steps"] == 0
+    art.positions[0] = 0.0
+    commanded = art.applied_actions[-1].joint_positions.tolist()
+    for _ in range(STALL_NO_PROGRESS_STEPS + 1):  # the first lagging step records the best lag
+        step(0.1)
+    assert handle._interp["stalled"] is True
+    assert art.applied_actions[-1].joint_positions.tolist() == pytest.approx(commanded)
+
+
+
+def test_path_lead_never_exceeds_the_settle_tolerance():
+    """The commanded target may run ahead of the measured joints by at most
+    SETTLE_TOL_RAD, so the tool stays on the planner's line."""
+    from isaac_module.sim_manager import SETTLE_TOL_RAD
+
+    handle, art, sim = _make_handle()
+    art.apply_action = lambda action: art.applied_actions.append(action)  # drives, not teleports
+    handle.follow_joint_path([[1.0, 0.0]], max_vel_rad_s=10.0)
+    step = _interp_step(sim, art)
+    worst = 0.0
+    for _ in range(400):
+        # a drive: every physics step the joint closes 30% of the gap to the last target
+        target = art.applied_actions[-1].joint_positions[0]
+        art.positions[0] += (float(target) - art.positions[0]) * 0.3
+        step(0.01)
+        worst = max(worst, art.applied_actions[-1].joint_positions[0] - art.positions[0])
+    assert worst <= SETTLE_TOL_RAD + 10.0 * 0.01 + 1e-9  # one step of advance past the check
+    assert handle._interp is None, "the path should complete once the drive keeps up"
+    assert art.positions[0] == pytest.approx(1.0, abs=0.02)
+
+
+
+def test_dense_waypoints_are_all_kept_and_followed_in_order():
+    """A linear plan's waypoints are ~0.3 deg apart, under the settle
+    tolerance; every one must become a segment so the tool follows the line
+    instead of jumping to the last waypoint (2026-09-05)."""
+    import math
+
+    handle, art, sim = _make_handle()
+    step_rad = math.radians(0.3)
+    waypoints = [[step_rad * (i + 1), -step_rad * (i + 1)] for i in range(30)]
+    handle.follow_joint_path(waypoints, max_vel_rad_s=1.0)
+    assert handle.path_progress() == (0, 30)
+    step = _interp_step(sim, art)
+    seen = []
+    for _ in range(400):
+        step(0.001)
+        seen.append(round(art.applied_actions[-1].joint_positions[0], 6))
+        if handle._interp is None:
+            break
+    assert handle._interp is None
+    assert seen == sorted(seen)  # monotonic through the waypoints, never a jump
+    assert seen[-1] == pytest.approx(step_rad * 30, rel=1e-4)
