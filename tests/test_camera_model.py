@@ -260,3 +260,58 @@ def test_validate_config_accepts_wrist_cam_attrs():
         )
     )
     assert list(deps) == ["sim-world"]
+
+
+def test_frame_derived_orientation_is_marked_ros_axes(world):
+    """A quat folded in from the Viam frame is ROS-optical (+Z forward); the
+    spawn must not read it as world axes (+X forward). GPU phase-4 run 1:
+    that mismatch aimed the side camera at the backdrop (7994 mm read)."""
+    config = _config("cam-frame-ov", {"world": "sim-world", "depth": True})
+    config.frame.parent = "world"
+    config.frame.translation.x = 575
+    config.frame.translation.y = 650
+    config.frame.translation.z = 900
+    vector = config.frame.orientation.vector_degrees
+    vector.x, vector.y, vector.z, vector.theta = 0.0, -650.0, -150.0, 0.0
+    cam = IsaacCamera.new(config, {})
+    assert cam._attrs["orientation_axes"] == "ros"
+    assert cam._attrs.get("orientation_wxyz") is not None
+
+
+def test_parent_prim_frame_orientation_is_not_marked(world):
+    config = _config(
+        "cam-riding", {"world": "sim-world", "depth": True, "parent_prim": "/World/arm/wrist"}
+    )
+    config.frame.parent = "pick-arm"
+    vector = config.frame.orientation.vector_degrees
+    vector.x, vector.y, vector.z, vector.theta = 0.0, 0.0, 1.0, 180.0
+    cam = IsaacCamera.new(config, {})
+    assert "orientation_axes" not in cam._attrs
+
+
+def test_place_camera_passes_orientation_axes_through():
+    from isaac_module.sim_manager import _place_camera
+
+    class FakeCam:
+        def __init__(self):
+            self.calls = []
+
+        def set_world_pose(self, position, quat, camera_axes):
+            self.calls.append((tuple(position), tuple(quat), camera_axes))
+
+    ros_cam = FakeCam()
+    _place_camera(
+        ros_cam,
+        {
+            "position": [0.575, 0.65, 0.9],
+            "orientation_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "orientation_axes": "ros",
+        },
+    )
+    legacy_cam = FakeCam()
+    _place_camera(
+        legacy_cam,
+        {"position": [0.575, 0.65, 0.9], "orientation_wxyz": [1.0, 0.0, 0.0, 0.0]},
+    )
+    assert ros_cam.calls[0][2] == "ros"
+    assert legacy_cam.calls[0][2] == "world"

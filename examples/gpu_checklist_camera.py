@@ -11,7 +11,7 @@ remote machine, not inside the module process.
 
 Usage::
 
-    python examples/gpu_checklist_phase2.py --address <machine-address> \\
+    python examples/gpu_checklist_camera.py --address <machine-address> \\
         --api-key <key> --api-key-id <key-id>
 """
 
@@ -32,7 +32,7 @@ from viam.robot.client import RobotClient
 from viam.services.vision import VisionClient
 
 # ----------------------------------------------------------------------
-# pure helpers - unit-testable without a robot (see tests/test_gpu_checklist_phase2.py)
+# pure helpers - unit-testable without a robot (see tests/test_gpu_checklist_camera.py)
 # ----------------------------------------------------------------------
 
 RgbPixel = tuple[int, int, int]

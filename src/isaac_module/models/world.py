@@ -69,8 +69,16 @@ DoCommand:
    "orientation_rpy_deg"?: [r,p,y] degrees} |
   {"command": "randomize_props", "names": [...],
    "region": [[x0,y0,z],[x1,y1,z]] mm, "seed": int,
-   "min_separation"?: mm (default 150)} ->
-    {"positions": {name: [x,y,z] mm}} |
+   "min_separation"?: mm (default 150),
+   "size_range_mm"?: [lo, hi] (applies to every named prop) or
+     {name: [lo, hi]} (keys must be a subset of "names"); cube props
+     only, 0 < lo <= hi. Redraws that prop's size (one uniform(lo, hi)
+     scalar applied to all three axes) before placing it, from the same
+     seeded stream as the positions, so sizes and positions both
+     reproduce for a given seed} ->
+    {"positions": {name: [x,y,z] mm}, "sizes_mm": {name: [x,y,z] mm}}
+    ("sizes_mm" is always present: the drawn dims for a ranged prop, its
+     current dims otherwise) |
   {"command": "ignore_props", "names": [...]} -> {"ignored": [...]}
     (empty list clears; excludes named props from get_geometries - DEC-21:
      excludes the pick target while grasping)
@@ -120,6 +128,13 @@ _SUPPORTED_COMMANDS = (
     "ignore_props",
 )
 
+# Commands that reveal or rewrite the scene's ground truth. A world configured
+# with "oracle_commands": false refuses them, so a caller holding the
+# machine's key (an agent under test) has to find objects by looking; the
+# grading oracle then measures placement through the cameras too, or through a
+# separate world that keeps these on.
+_ORACLE_COMMANDS = frozenset({"prop_geometries", "spawn_prop", "set_prop_pose", "randomize_props"})
+
 
 def _prop_label(prop: object, index: int) -> str:
     if isinstance(prop, Mapping) and prop.get("name"):
@@ -153,6 +168,42 @@ def _validate_orientation(label: str, prop: Mapping[str, object]) -> None:
                 raise ValueError(f"prop {label}: 'orientation_wxyz' must be a list of 4 numbers")
         if all(float(v) == 0.0 for v in value):
             raise ValueError(f"prop {label}: 'orientation_wxyz' must not be all zero")
+
+
+def _validate_size_range_pair(range_value: object) -> tuple[float, float]:
+    if (
+        not isinstance(range_value, Sequence)
+        or isinstance(range_value, str)
+        or len(range_value) != 2
+    ):
+        raise ValueError("randomize_props: size_range_mm entries must be [lo, hi]")
+    lo, hi = range_value
+    if not isinstance(lo, (int, float)) or isinstance(lo, bool):
+        raise ValueError("randomize_props: size_range_mm entries must be [lo, hi] numbers")
+    if not isinstance(hi, (int, float)) or isinstance(hi, bool):
+        raise ValueError("randomize_props: size_range_mm entries must be [lo, hi] numbers")
+    lo_f, hi_f = float(lo), float(hi)
+    if not (0.0 < lo_f <= hi_f):
+        raise ValueError(
+            f"randomize_props: size_range_mm [{lo_f}, {hi_f}] must satisfy 0 < lo <= hi"
+        )
+    return lo_f, hi_f
+
+
+def _validate_size_range_mm(names: list[str], value: object) -> dict[str, tuple[float, float]]:
+    if isinstance(value, Mapping):
+        unknown = set(value) - set(names)
+        if unknown:
+            raise ValueError(
+                f"randomize_props: size_range_mm names not in names: {sorted(unknown)}"
+            )
+        return {
+            str(name): _validate_size_range_pair(range_value) for name, range_value in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, str):
+        pair = _validate_size_range_pair(value)
+        return dict.fromkeys(names, pair)
+    raise ValueError("randomize_props: size_range_mm must be [lo, hi] or {name: [lo, hi]}")
 
 
 def _validate_box_dims(label: str, prop: Mapping[str, object]) -> None:
@@ -342,12 +393,15 @@ class IsaacWorld(Generic, EasyResource):  # type: ignore[misc]  # SDK: API is Fi
             _validate_lighting(attrs["lighting"])
         if "render" in attrs:
             _validate_render(attrs["render"], bool(attrs.get("livestream", True)))
+        if "oracle_commands" in attrs and not isinstance(attrs["oracle_commands"], bool):
+            raise ValueError('"oracle_commands" must be true or false')
         return [], []
 
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
         attrs: dict[str, Any] = dict(struct_to_dict(config.attributes))
+        self._oracle_commands = bool(attrs.get("oracle_commands", True))
         if attrs.get("usd_stage") and "lighting" not in attrs:
             LOGGER.warning("usd_stage is set without lighting: stage must provide floor and lights")
         cfg = SimConfig(
@@ -419,6 +473,11 @@ class IsaacWorld(Generic, EasyResource):  # type: ignore[misc]  # SDK: API is Fi
     ) -> Mapping[str, ValueTypes]:
         handle = self._handle()
         cmd = str(command.get("command", ""))
+        if cmd in _ORACLE_COMMANDS and not getattr(self, "_oracle_commands", True):
+            raise ValueError(
+                f"{cmd!r} is disabled on this world (oracle_commands is false): scene ground truth "
+                "is not exposed; observe the scene through the cameras"
+            )
         if cmd == "status":
             return handle.status()
         if cmd == "play":
@@ -492,13 +551,28 @@ class IsaacWorld(Generic, EasyResource):  # type: ignore[misc]  # SDK: API is Fi
             min_separation_mm = float(
                 cast("Any", command.get("min_separation", DEFAULT_MIN_SEPARATION_MM))
             )
-            positions_m = handle.randomize_props(
-                names, cast("Any", region_m), seed, min_separation_m=min_separation_mm / MM_PER_M
+            size_range_mm = command.get("size_range_mm")
+            size_range_m: dict[str, tuple[float, float]] | None = None
+            if size_range_mm is not None:
+                ranges_mm = _validate_size_range_mm(names, size_range_mm)
+                size_range_m = {
+                    name: (lo / MM_PER_M, hi / MM_PER_M) for name, (lo, hi) in ranges_mm.items()
+                }
+            result = handle.randomize_props(
+                names,
+                cast("Any", region_m),
+                seed,
+                min_separation_m=min_separation_mm / MM_PER_M,
+                size_range_m=size_range_m,
             )
             positions_mm: dict[str, ValueTypes] = {
-                name: [v * MM_PER_M for v in position] for name, position in positions_m.items()
+                name: [v * MM_PER_M for v in position]
+                for name, position in result.positions_m.items()
             }
-            return {"positions": positions_mm}
+            sizes_mm: dict[str, ValueTypes] = {
+                name: [v * MM_PER_M for v in dims] for name, dims in result.dims_m.items()
+            }
+            return {"positions": positions_mm, "sizes_mm": sizes_mm}
         if cmd == "ignore_props":
             names = [str(n) for n in cast("Sequence[str]", command.get("names") or [])]
             self._ignored_props = set(names)

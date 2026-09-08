@@ -9,14 +9,14 @@ without viam-server in the loop.
 Runs INSIDE Isaac Sim's python (it boots a headless ``SimulationApp`` to get
 the asset resolver and ``omni.client``), e.g. on the GPU machine::
 
-    ~/isaacsim/python.sh examples/gpu_checklist_phase3.py            # item 1, default asset
-    ~/isaacsim/python.sh examples/gpu_checklist_phase3.py --usd omniverse://.../Robotiq_2F_85_edit.usd
+    ~/isaacsim/python.sh examples/gpu_checklist_gripper_asset.py            # item 1, default asset
+    ~/isaacsim/python.sh examples/gpu_checklist_gripper_asset.py --usd omniverse://.../Robotiq_2F_85_edit.usd
 
 Prints one PASS/FAIL line per item plus the raw observations to paste into
 ``.claude/plans/pick-place-mvp/phase-3-grasp-and-lift.md`` Notes.
 
 The pure helpers at the top take plain records so they are unit-tested on a
-laptop (see tests/test_gpu_checklist_phase3.py).
+laptop (see tests/test_gpu_checklist_gripper_asset.py).
 """
 
 from __future__ import annotations

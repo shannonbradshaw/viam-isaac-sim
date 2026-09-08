@@ -12,17 +12,17 @@ as ``examples/pick_red_block.py``.
 
 Usage (real machine)::
 
-    python examples/gpu_checklist_phase4.py --address <machine-address> \\
+    python examples/gpu_checklist_world.py --address <machine-address> \\
         --api-key <key> --api-key-id <key-id> --world sim-world
 
 Usage (in-process mock, no GPU, no running machine)::
 
-    PYTHONPATH=src python examples/gpu_checklist_phase4.py --mock
+    PYTHONPATH=src python examples/gpu_checklist_world.py --mock
 
 Prints one report line per item plus the raw observations to paste into
 ``.claude/plans/pick-place-mvp/phase-4-*.md`` Notes. The pure/async helpers at
 the top take a duck-typed world so they are unit-tested on a laptop against the
-mock world (see tests/test_gpu_checklist_phase4.py).
+mock world (see tests/test_gpu_checklist_world.py).
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from typing import Any, Protocol
 MM_PER_M = 1000.0
 
 DEFAULT_WINDOW_S = 10.0
-DEFAULT_PROP_NAME = "gpu_checklist_phase4_cube"
+DEFAULT_PROP_NAME = "gpu_checklist_world_cube"
 DEFAULT_CUBE_SIZE_M = 0.05
 DEFAULT_SPAWN_POSITION_MM = (500.0, 0.0, 100.0)
 DEFAULT_TELEPORT_POSITION_MM = (700.0, 200.0, 150.0)

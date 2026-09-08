@@ -28,14 +28,18 @@ MODELS = {
 }
 API_PATTERN = re.compile(r"^rdk:component:[a-z_]+$")
 
-# Seam — P5 canonical cell: the five `$variable`s the fragment ships, keyed by
+# Seam — P5 canonical cell: the nine `$variable`s the fragment ships, keyed by
 # name, with the default_value a fresh machine that sets nothing must boot.
 EXPECTED_VARIABLE_DEFAULTS: dict[str, Any] = {
     "table-height-m": 0.75,
     "pick-block-color": [0.9, 0.1, 0.1],
     "distractor-color-green": [0.05, 0.65, 0.1],
     "distractor-color-blue": [0.05, 0.1, 0.9],
+    "distractor-color-yellow": [0.9, 0.75, 0.05],
+    "distractor-color-purple": [0.55, 0.1, 0.75],
+    "distractor-color-orange": [1.0, 0.55, 0.05],
     "detect-color": "#EA8D8D",
+    "hue-tolerance-pct": 0.05,
 }
 
 
@@ -103,7 +107,7 @@ def _component_config(component: dict) -> ComponentConfig:
 
 def test_fragment_is_valid_json_with_the_expected_components():
     names = [c["name"] for c in _fragment()["components"]]
-    assert names == ["sim-world", "pick-arm", "pick-grip", "scene-cam", "wrist-cam"]
+    assert names == ["sim-world", "pick-arm", "pick-grip", "scene-cam", "side-cam", "wrist-cam"]
 
 
 def test_every_component_uses_the_api_form_not_the_legacy_namespace_type_pair():
@@ -171,6 +175,70 @@ def test_wrist_camera_matches_the_phase_2_contract():
     assert "local_position" not in wrist["attributes"]  # the frame is the mount's source of truth
 
 
+def test_wrist_and_side_cameras_carry_a_collision_geometry_for_the_planner():
+    """Both cameras ride within reach of the planner's swept volume, so each
+    carries its RealSense body (90x25x25 mm, long axis along the frame's x,
+    centred on the frame origin) as frame geometry with no translation.
+    A box, not the tools/generate_realsense_mesh.py mesh: the app's fragment
+    validation rejected mesh geometries on 2026-09-02 (phase-4 §Deferred)."""
+    for name in ("wrist-cam", "side-cam"):
+        component = next(c for c in _fragment()["components"] if c["name"] == name)
+        geometry = component["frame"]["geometry"]
+        assert geometry["type"] == "box"
+        assert geometry["x"] == 90
+        assert geometry["y"] == 25
+        assert geometry["z"] == 25
+        assert "translation" not in geometry
+
+
+def test_side_cam_body_is_a_fixed_prop_facing_away_from_its_own_camera():
+    """The rendered RealSense housing must be fixed (it's bolted, not
+    scattered) and its front face must sit behind the side-cam viewpoint
+    (y 0.65 m) so the camera never sees the inside of its own body."""
+    world = next(c for c in _resolved_fragment()["components"] if c["name"] == "sim-world")
+    body = next(p for p in world["attributes"]["props"] if p["name"] == "side_cam_body")
+    assert body["fixed"] is True
+    y_position = body["position"][1]
+    y_half_extent = body["size"] * body["scale"][1] / 2
+    front_face_y = y_position - y_half_extent
+    assert front_face_y >= 0.65
+
+
+def test_side_camera_sits_outside_the_scatter_region_and_aims_at_its_centre():
+    """Phase 4 seam: `side-cam` is planted just past the scatter region's +y
+    edge (y 250 mm) at lens height ~150 mm above the table top, below
+    1000 mm so it stays tabletop-adjacent. It aims via a FRAME orientation,
+    not `target`: the frame is what transform_pose reports, so prim aim and
+    frame claim must be one quaternion (GPU phase-4 run 1: `target` aimed the
+    prim while the frame claimed identity, and side scans measured the
+    backdrop at 7994 mm). The orientation vector must point from the lens to
+    the scatter-region centre on the table top."""
+    side = next(c for c in _fragment()["components"] if c["name"] == "side-cam")
+    assert side["frame"]["parent"] == "world"
+    translation = side["frame"]["translation"]
+    assert translation["y"] > 250
+    assert translation["y"] < 1000
+    assert side["attributes"]["depth"] is True
+    assert "target" not in side["attributes"]
+
+    orientation = side["frame"]["orientation"]
+    assert orientation["type"] == "ov_degrees"
+    vector = orientation["value"]
+    region_centre_mm = (575.0, 0.0, 750.0)
+    aim = [
+        region_centre_mm[i] - (translation["x"], translation["y"], translation["z"])[i]
+        for i in range(3)
+    ]
+    ov = [vector["x"], vector["y"], vector["z"]]
+    cross = [
+        aim[1] * ov[2] - aim[2] * ov[1],
+        aim[2] * ov[0] - aim[0] * ov[2],
+        aim[0] * ov[1] - aim[1] * ov[0],
+    ]
+    assert all(abs(c) < 1e-9 for c in cross)  # parallel to the lens->centre ray
+    assert sum(a * o for a, o in zip(aim, ov, strict=True)) > 0  # and not flipped away from it
+
+
 def test_sim_world_is_in_the_frame_system():
     """DEC-21 route (c): the motion service only pulls sim-world's live
     GetGeometries (props + floor) into planning when the component has a
@@ -206,26 +274,47 @@ def test_sim_world_geometry_matches_the_table_prop_minus_ten_millimetres():
     assert translation["z"] + geometry["z"] / 2 == pytest.approx(table_top_mm - 10)
 
 
-def test_three_blocks_follow_the_layout_rules():
-    """W23-W26 via the DEC-20 naming: one red target, two colour-distinct
-    distractors, all movable, spawned >= 0.20 m apart (W26) and inside the
-    verified 743 mm pick radius measured from the arm base (150, -250 mm)."""
+def test_six_blocks_follow_the_layout_rules():
+    """W23-W26 via the DEC-20 naming: one red target plus five colour-distinct
+    distractors, all movable, spawned >= 0.20 m apart (W26), inside the
+    verified 743 mm pick radius measured from the arm base (150, -250 mm),
+    and clear of the place_pad footprint."""
     import itertools
     import math
 
     world = next(c for c in _resolved_fragment()["components"] if c["name"] == "sim-world")
     props = {p["name"]: p for p in world["attributes"]["props"]}
-    blocks = ["pick_cube", "ignore_cube_green", "ignore_cube_blue"]
+    blocks = [
+        "pick_cube",
+        "ignore_cube_green",
+        "ignore_cube_blue",
+        "ignore_cube_yellow",
+        "ignore_cube_purple",
+        "ignore_cube_orange",
+    ]
     assert all(name in props for name in blocks)
 
-    dominant_channels = [max(range(3), key=lambda i: props[b]["color"][i]) for b in blocks]
+    dominant_channel_blocks = ["pick_cube", "ignore_cube_green", "ignore_cube_blue"]
+    dominant_channels = [
+        max(range(3), key=lambda i: props[b]["color"][i]) for b in dominant_channel_blocks
+    ]
     assert dominant_channels == [0, 1, 2]  # red target, green and blue distractors
 
     arm_base_x, arm_base_y = 0.150, -0.250
+    block_half_size = 0.03
+    place_pad_x_range = (0.2, 0.4)
+    place_pad_y_range = (0.15, 0.35)
     for name in blocks:
         assert not props[name].get("fixed", False)
         x, y, _z = props[name]["position"]
         assert math.hypot(x - arm_base_x, y - arm_base_y) <= 0.743
+        clear_of_pad_x = (
+            x + block_half_size < place_pad_x_range[0] or x - block_half_size > place_pad_x_range[1]
+        )
+        clear_of_pad_y = (
+            y + block_half_size < place_pad_y_range[0] or y - block_half_size > place_pad_y_range[1]
+        )
+        assert clear_of_pad_x or clear_of_pad_y
 
     for a, b in itertools.combinations(blocks, 2):
         ax, ay, _az = props[a]["position"]
@@ -237,10 +326,27 @@ def test_the_pick_cell_roster_is_present():
     fragment = _fragment()
     world = next(c for c in fragment["components"] if c["name"] == "sim-world")
     props = {p["name"] for p in world["attributes"]["props"]}
-    assert props == {"table", "pick_cube", "ignore_cube_green", "ignore_cube_blue", "place_pad"}
+    assert props == {
+        "table",
+        "pick_cube",
+        "ignore_cube_green",
+        "ignore_cube_blue",
+        "ignore_cube_yellow",
+        "ignore_cube_purple",
+        "ignore_cube_orange",
+        "place_pad",
+        "side_cam_body",
+    }
 
     component_names = {c["name"] for c in fragment["components"]}
-    assert component_names == {"sim-world", "pick-arm", "pick-grip", "wrist-cam", "scene-cam"}
+    assert component_names == {
+        "sim-world",
+        "pick-arm",
+        "pick-grip",
+        "wrist-cam",
+        "scene-cam",
+        "side-cam",
+    }
 
     service_names = {(s["name"], s["api"]) for s in fragment["services"]}
     # RDK serves the builtin motion service implicitly, so the fragment may
@@ -253,7 +359,58 @@ def test_the_pick_cell_roster_is_present():
     }
 
 
-def test_the_five_variables_ship_with_the_seam_default_values():
+def test_the_nine_variables_ship_with_the_seam_default_values():
     found: dict[str, Any] = {}
     _collect_variables(_fragment(), found)
     assert found == EXPECTED_VARIABLE_DEFAULTS
+
+
+def _hue_degrees(color: list[float]) -> float:
+    import colorsys
+
+    r, g, b = color
+    h, _s, _v = colorsys.rgb_to_hsv(r, g, b)
+    return h * 360
+
+
+def _hex_to_hue_degrees(hex_color: str) -> float:
+    import colorsys
+
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i : i + 2], 16) / 255 for i in (0, 2, 4))
+    h, _s, _v = colorsys.rgb_to_hsv(r, g, b)
+    return h * 360
+
+
+def test_the_red_detector_band_admits_only_the_pick_cube_hue():
+    """The detector must fire on the red target and stay clear of every
+    distractor by margin, with each distractor still inside its intended
+    colour family so the margin cannot be gamed by drifting a hue."""
+    fragment = _resolved_fragment()
+    world = next(c for c in fragment["components"] if c["name"] == "sim-world")
+    props = {p["name"]: p for p in world["attributes"]["props"]}
+    detector = next(s for s in fragment["services"] if s["name"] == "red-detector")
+
+    detect_hue = _hex_to_hue_degrees(detector["attributes"]["detect_color"])
+    hue_tolerance_pct = detector["attributes"]["hue_tolerance_pct"]
+    band_half_width = hue_tolerance_pct * 360
+
+    def hue_distance(hue: float) -> float:
+        diff = abs(hue - detect_hue) % 360
+        return min(diff, 360 - diff)
+
+    pick_cube_hue = _hue_degrees(props["pick_cube"]["color"])
+    assert hue_distance(pick_cube_hue) <= band_half_width
+
+    distractor_families = {
+        "ignore_cube_green": (90, 150),
+        "ignore_cube_blue": (200, 260),
+        "ignore_cube_yellow": (40, 70),
+        "ignore_cube_purple": (240, 320),
+        "ignore_cube_orange": (20, 40),
+    }
+    margin_deg = 10
+    for name, (low, high) in distractor_families.items():
+        hue = _hue_degrees(props[name]["color"])
+        assert low <= hue <= high
+        assert hue_distance(hue) >= band_half_width + margin_deg

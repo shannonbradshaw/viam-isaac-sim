@@ -16,6 +16,8 @@ Attributes:
   clip_near / clip_far (m)        - render clipping planes, default 0.05/10.0
   image_format ("png"|"jpeg")     - colour encoding for GetImages, default "png"
   frequency (float)               - capture rate; unset = every rendered frame
+  stream_fps (float)              - frame rate reported to rdk for the WebRTC
+                                    stream (bitrate + pacing); unset = frequency
   parent_prim (string)            - create the camera as a child of this prim
                                     so it moves with it, e.g. an arm's wrist
                                     link for an end-effector camera. A
@@ -122,6 +124,14 @@ class IsaacCamera(Camera, EasyResource):  # type: ignore[misc]  # SDK: API is Fi
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
         attrs = apply_frame_to_attrs(config, get_attrs(config))
+        # a frame-derived quat is ROS-optical (+Z forward, the frame system's
+        # convention); a legacy orientation_wxyz attr stays world axes
+        if (
+            config.HasField("frame")
+            and config.frame.HasField("orientation")
+            and not attrs.get("parent_prim")
+        ):
+            attrs["orientation_axes"] = "ros"
         self._attrs = attrs
         self._handle = SimManager.get().create_camera(self.name, attrs)
 
@@ -201,7 +211,14 @@ class IsaacCamera(Camera, EasyResource):  # type: ignore[misc]  # SDK: API is Fi
 
         cfg = SimManager.get().cfg
         rendering_dt = cfg.rendering_dt if cfg is not None else SimConfig.rendering_dt
-        frame_rate = handle.frequency if handle.frequency else 1.0 / rendering_dt
+        # stream_fps (if set) drives the WebRTC bitrate and frame pacing; it is
+        # independent of the capture frequency so an overview stream can be sharp
+        # without raising render cost. Falls back to frequency, then render rate.
+        frame_rate = (
+            handle.stream_fps
+            if getattr(handle, "stream_fps", None)
+            else (handle.frequency if handle.frequency else 1.0 / rendering_dt)
+        )
 
         return GetPropertiesResponse(
             supports_pcd=handle.depth_enabled,
@@ -301,6 +318,9 @@ def _validate_camera_attrs(name: str, attrs: dict[str, Any]) -> None:
     frequency = attrs.get("frequency")
     if frequency is not None and not (isinstance(frequency, (int, float)) and frequency > 0):
         raise ValueError(f'{name}: "frequency" must be > 0 when set, got {frequency!r}')
+    stream_fps = attrs.get("stream_fps")
+    if stream_fps is not None and not (isinstance(stream_fps, (int, float)) and stream_fps > 0):
+        raise ValueError(f'{name}: "stream_fps" must be > 0 when set, got {stream_fps!r}')
 
     depth = attrs.get("depth", False)
     if not isinstance(depth, bool):

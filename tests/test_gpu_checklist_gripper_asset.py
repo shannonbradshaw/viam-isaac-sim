@@ -1,4 +1,4 @@
-"""Unit tests for the pure helpers in examples/gpu_checklist_phase3.py (item 1:
+"""Unit tests for the pure helpers in examples/gpu_checklist_gripper_asset.py (item 1:
 R-4 / OQ-4 pad-collision probe). Loaded via importlib like the phase-1/2
 checklist tests - examples/ is not on pythonpath and the runner half only
 works inside Isaac's python."""
@@ -7,11 +7,13 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_MODULE_PATH = Path(__file__).resolve().parent.parent / "examples" / "gpu_checklist_phase3.py"
-_spec = importlib.util.spec_from_file_location("gpu_checklist_phase3", _MODULE_PATH)
+_MODULE_PATH = (
+    Path(__file__).resolve().parent.parent / "examples" / "gpu_checklist_gripper_asset.py"
+)
+_spec = importlib.util.spec_from_file_location("gpu_checklist_gripper_asset", _MODULE_PATH)
 assert _spec is not None and _spec.loader is not None
 probe = importlib.util.module_from_spec(_spec)
-sys.modules["gpu_checklist_phase3"] = probe
+sys.modules["gpu_checklist_gripper_asset"] = probe
 _spec.loader.exec_module(probe)
 
 PrimRecord = probe.PrimRecord

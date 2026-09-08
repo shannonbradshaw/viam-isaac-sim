@@ -389,3 +389,27 @@ def test_create_camera_called_twice_registers_hook_only_once(sim):
 
     sim.reset()
     assert call_count == 1
+
+
+
+class FakeCamWithFrameInfo(FakeCam):
+    def __init__(self, rendering_times, **kw):
+        super().__init__(**kw)
+        self._rendering_times = list(rendering_times)
+
+    def get_current_frame(self):
+        return {"rendering_time": self._rendering_times.pop(0)}
+
+
+def test_stale_frame_is_not_served_until_the_renderer_catches_up():
+    """After a boot the renderer lags the simulation by seconds and the first
+    reads show the scene from before the arm moved (2026-09-04)."""
+    import numpy as np
+
+    cam = FakeCamWithFrameInfo(rendering_times=[0.0, 0.0, 9.9])
+    cam.set_rgba_sequence([np.zeros((4, 4, 4), dtype=np.uint8)])
+    handle, sim, sleeps = _make_handle(cam)
+    sim.world.current_time = 10.0
+    frame = handle.get_frame()
+    assert frame.sim_time == 10.0
+    assert len(sleeps) == 2  # two stale reads, then a frame within STALE_FRAME_S

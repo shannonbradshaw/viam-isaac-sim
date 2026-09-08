@@ -10,9 +10,11 @@ import pytest
 
 from isaac_module.sim_manager import (
     DEFAULT_MIN_SEPARATION_M,
+    PROP_REST_EPSILON_M,
     IsaacWorldHandle,
     MockWorldHandle,
     PropGeometry,
+    RandomizeResult,
     SimConfig,
     SimManager,
     prop_box_dims,
@@ -28,7 +30,11 @@ def _cube(name: str, **extra) -> dict:
 
 
 def _mock_handle(props: list[dict]) -> MockWorldHandle:
+    # production invariant: MockWorldHandle is only built by the mock boot
+    # path, so the manager it wraps always has mock=True (a sized randomize
+    # relies on it - _reset_world skips the isaac world only in mock mode)
     manager = SimManager()
+    manager.mock = True
     return MockWorldHandle(manager, props)
 
 
@@ -163,22 +169,23 @@ def test_randomize_props_is_deterministic_for_a_given_seed():
     second = handle2.randomize_props(["a", "b"], REGION, seed=1)
 
     assert first == second
+    assert isinstance(first, RandomizeResult)
 
 
 def test_randomize_props_respects_region_and_separation_bounds():
     handle = _mock_handle([_cube("a"), _cube("b"), _cube("c")])
     dims = prop_box_dims(_cube("a"))
-    placed = handle.randomize_props(["a", "b", "c"], REGION, seed=1)
+    result = handle.randomize_props(["a", "b", "c"], REGION, seed=1)
 
     (lo_x, lo_y, z0), (hi_x, hi_y, z1) = REGION
     face_z = (z0 + z1) / 2.0
     half = dims[0] / 2.0
 
-    positions = list(placed.values())
+    positions = list(result.positions_m.values())
     for x, y, z in positions:
         assert lo_x + half <= x <= hi_x - half
         assert lo_y + half <= y <= hi_y - half
-        assert z == pytest.approx(face_z + dims[2] / 2.0)
+        assert z == pytest.approx(face_z + dims[2] / 2.0 + PROP_REST_EPSILON_M)
 
     for i, (x0, y0, _z0) in enumerate(positions):
         for x1, y1, _z1 in positions[i + 1 :]:
@@ -189,6 +196,90 @@ def test_randomize_props_unknown_name_raises_value_error():
     handle = _mock_handle([_cube("a")])
     with pytest.raises(ValueError):
         handle.randomize_props(["a", "ghost"], REGION, seed=1)
+
+
+def test_randomize_props_no_range_matches_sample_prop_positions_baseline():
+    dims = {"a": prop_box_dims(_cube("a")), "b": prop_box_dims(_cube("b"))}
+    baseline = sample_prop_positions(dims, REGION, seed=5)
+    handle = _mock_handle([_cube("a"), _cube("b")])
+    result = handle.randomize_props(["a", "b"], REGION, seed=5)
+    assert result.positions_m == baseline
+
+
+def test_randomize_props_size_range_reproduces_sizes_and_positions_for_a_seed():
+    handle = _mock_handle([_cube("a"), _cube("b")])
+    size_range = {"a": (0.03, 0.09), "b": (0.03, 0.09)}
+    first = handle.randomize_props(["a", "b"], REGION, seed=2, size_range_m=size_range)
+
+    handle2 = _mock_handle([_cube("a"), _cube("b")])
+    second = handle2.randomize_props(["a", "b"], REGION, seed=2, size_range_m=size_range)
+
+    assert first == second
+    assert first.dims_m["a"] != prop_box_dims(_cube("a"))  # actually drew a new size
+
+
+def test_randomize_props_drawn_dims_flow_into_prop_geometries_mock():
+    handle = _mock_handle([_cube("a")])
+    result = handle.randomize_props(["a"], REGION, seed=1, size_range_m={"a": (0.09, 0.09)})
+    (geom,) = handle.prop_geometries()
+    assert geom.box_dims_m == pytest.approx(result.dims_m["a"])
+    assert geom.box_dims_m == pytest.approx((0.09, 0.09, 0.09))
+
+
+def test_randomize_props_edge_aware_separation_at_the_default_min_separation():
+    handle = _mock_handle([_cube("a"), _cube("b")])
+    result = handle.randomize_props(
+        ["a", "b"],
+        REGION,
+        seed=1,
+        min_separation_m=0.1,
+        size_range_m={"a": (0.09, 0.09), "b": (0.09, 0.09)},
+    )
+    (ax, ay, _az), (bx, by, _bz) = result.positions_m.values()
+    assert math.hypot(ax - bx, ay - by) >= 0.1
+
+
+def test_randomize_props_edge_aware_separation_exceeds_min_separation():
+    handle = _mock_handle([_cube("a"), _cube("b")])
+    result = handle.randomize_props(
+        ["a", "b"],
+        REGION,
+        seed=1,
+        min_separation_m=0.02,
+        size_range_m={"a": (0.12, 0.12), "b": (0.12, 0.12)},
+    )
+    (ax, ay, _az), (bx, by, _bz) = result.positions_m.values()
+    edge_bound = 0.12 + 0.01  # (0.12 + 0.12) / 2 + PROP_EDGE_CLEARANCE_M
+    assert math.hypot(ax - bx, ay - by) >= edge_bound
+    assert (
+        edge_bound > 0.02
+    )  # the old plain-min_separation rule would have allowed this pair closer
+
+
+def test_randomize_props_rescale_is_absolute_not_compounding_mock():
+    handle = _mock_handle([_cube("a", size=0.05)])
+    first = handle.randomize_props(["a"], REGION, seed=1, size_range_m={"a": (0.09, 0.09)})
+    assert first.dims_m["a"] == pytest.approx((0.09, 0.09, 0.09))
+
+    second = handle.randomize_props(["a"], REGION, seed=1, size_range_m={"a": (0.03, 0.03)})
+    assert second.dims_m["a"] == pytest.approx((0.03, 0.03, 0.03))
+
+    third = handle.randomize_props(["a"], REGION, seed=1, size_range_m={"a": (0.09, 0.09)})
+    assert third.dims_m["a"] == pytest.approx((0.09, 0.09, 0.09))
+
+
+def test_randomize_props_size_range_non_cube_prop_raises_value_error():
+    handle = _mock_handle(
+        [{"type": "usd", "name": "u", "usd_path": "x.usd", "box_dims": [0.1, 0.1, 0.1]}]
+    )
+    with pytest.raises(ValueError):
+        handle.randomize_props(["u"], REGION, seed=1, size_range_m={"u": (0.03, 0.09)})
+
+
+def test_randomize_props_size_range_key_not_in_names_raises_value_error():
+    handle = _mock_handle([_cube("a"), _cube("b")])
+    with pytest.raises(ValueError):
+        handle.randomize_props(["a"], REGION, seed=1, size_range_m={"b": (0.03, 0.09)})
 
 
 # ----------------------------------------------------------------------
@@ -267,6 +358,7 @@ class _FakeXForm:
 
     def __init__(self, prim_path: str, name: str = "", position=None, orientation=None, **_ignored):
         self.prim_path = prim_path
+        self.name = name
         if position is not None or orientation is not None:
             self.set_world_pose(position=position, orientation=orientation)
         elif prim_path not in self._STORE:
@@ -284,27 +376,59 @@ class _FakeXForm:
         return self._STORE[self.prim_path]
 
 
-class _FakeScene:
-    def add(self, obj) -> None:
-        pass
+# ordered trace of the sized-randomize sim calls: the GPU defect was purely
+# an ordering one (a scale authored mid-play is reverted by the stop inside
+# reset), so the assertion has to see the sequence, not just the counts
+FAKE_SIM_EVENTS: list[str] = []
 
-    def get_object(self, _name):
-        return None
+
+class _FakeCubeObject(_FakeXForm):
+    """Stands in for the scene-registered Dynamic/FixedCuboid object
+    (SCN-16 sized props): adds set_local_scale, the API IsaacWorldHandle
+    rescales through."""
+
+    _SCALE_STORE: dict[str, np.ndarray] = {}
+
+    def set_local_scale(self, scale) -> None:
+        FAKE_SIM_EVENTS.append("scale")
+        self._SCALE_STORE[self.prim_path] = np.array([float(v) for v in scale])
+
+    def get_local_scale(self):
+        return self._SCALE_STORE.get(self.prim_path, np.array([1.0, 1.0, 1.0]))
+
+
+class _FakeScene:
+    def __init__(self) -> None:
+        self._objects: dict[str, object] = {}
+
+    def add(self, obj) -> None:
+        name = getattr(obj, "name", None)
+        if name:
+            self._objects[name] = obj
+
+    def get_object(self, name):
+        return self._objects.get(name)
 
 
 class _FakeWorld:
     def __init__(self) -> None:
         self.scene = _FakeScene()
         self.reset_calls = 0
+        self.stop_calls = 0
 
     def reset(self) -> None:
+        FAKE_SIM_EVENTS.append("reset")
         self.reset_calls += 1
+
+    def stop(self) -> None:
+        FAKE_SIM_EVENTS.append("stop")
+        self.stop_calls += 1
 
 
 class _FakeIsaacNamespace:
     SingleXFormPrim = _FakeXForm
-    DynamicCuboid = _FakeXForm
-    FixedCuboid = _FakeXForm
+    DynamicCuboid = _FakeCubeObject
+    FixedCuboid = _FakeCubeObject
     PhysicsMaterial = None
     PhysxSchema = None
 
@@ -316,6 +440,8 @@ class _FakeIsaacNamespace:
 @pytest.fixture
 def isaac_handle():
     _FakeXForm._STORE.clear()
+    _FakeCubeObject._SCALE_STORE.clear()
+    FAKE_SIM_EVENTS.clear()
     manager = SimManager()
     manager.mock = False
     manager.world = _FakeWorld()
@@ -369,6 +495,70 @@ def test_isaac_handle_spawn_prop_duplicate_name_raises_value_error(isaac_handle)
         isaac_handle.spawn_prop(_cube("a"))
 
 
+def test_isaac_handle_randomize_props_rescales_and_updates_prop_geometries(isaac_handle):
+    result = isaac_handle.randomize_props(["a"], REGION, seed=1, size_range_m={"a": (0.09, 0.09)})
+    assert result.dims_m["a"] == pytest.approx((0.09, 0.09, 0.09))
+
+    (geom,) = isaac_handle.prop_geometries()
+    assert geom.box_dims_m == pytest.approx((0.09, 0.09, 0.09))
+
+    scene_object = isaac_handle._sim.world.scene.get_object("a")
+    assert scene_object.get_local_scale() == pytest.approx(np.array([1.8, 1.8, 1.8]))
+
+
+def test_isaac_handle_randomize_props_rescale_is_absolute_not_compounding(isaac_handle):
+    first = isaac_handle.randomize_props(["a"], REGION, seed=1, size_range_m={"a": (0.09, 0.09)})
+    assert first.dims_m["a"] == pytest.approx((0.09, 0.09, 0.09))
+
+    second = isaac_handle.randomize_props(["a"], REGION, seed=1, size_range_m={"a": (0.03, 0.03)})
+    assert second.dims_m["a"] == pytest.approx((0.03, 0.03, 0.03))
+
+    third = isaac_handle.randomize_props(["a"], REGION, seed=1, size_range_m={"a": (0.09, 0.09)})
+    assert third.dims_m["a"] == pytest.approx((0.09, 0.09, 0.09))
+
+
+def test_isaac_handle_randomize_props_size_range_non_cube_prop_raises_value_error(isaac_handle):
+    isaac_handle._sim._spawn_prop(
+        {"type": "usd", "name": "u", "usd_path": "x.usd", "box_dims": [0.1, 0.1, 0.1]}
+    )
+    with pytest.raises(ValueError):
+        isaac_handle.randomize_props(["u"], REGION, seed=1, size_range_m={"u": (0.03, 0.09)})
+
+
+def test_isaac_handle_sized_randomize_stops_scales_then_resets_in_order(isaac_handle):
+    """GPU failures (phase-3 checklist): a scale written mid-play invalidates
+    PhysX's tensor view ('Failed to get rigid body transforms from backend'),
+    and a scale written before the reset is REVERTED by the stop inside it
+    (drawn 44.7 mm, block stayed 60 mm). The only working order is stop ->
+    scale -> reset; an unsized randomize must do none of it."""
+    hook_runs: list[int] = []
+    isaac_handle._sim.register_post_reset(lambda: hook_runs.append(1), owner="test")
+
+    isaac_handle.randomize_props(["a"], REGION, seed=1)
+    assert FAKE_SIM_EVENTS == []
+    assert hook_runs == []
+
+    isaac_handle.randomize_props(["a"], REGION, seed=1, size_range_m={"a": (0.09, 0.09)})
+    assert FAKE_SIM_EVENTS == ["stop", "scale", "reset"]
+    assert hook_runs == [1]
+
+
+def test_mock_sized_randomize_snaps_unnamed_props_to_spawn_like_isaac():
+    """API parity with the isaac handle's full-reset pattern: a sized
+    randomize returns every prop to its spawn pose before the named ones
+    teleport; an unsized randomize leaves other props where they are."""
+    handle = _mock_handle([_cube("a"), _cube("bystander", position=[0.1, 0.2, 0.03])])
+    handle.set_prop_pose("bystander", (0.5, 0.5, 0.03))
+
+    handle.randomize_props(["a"], REGION, seed=1)
+    (bystander,) = [g for g in handle.prop_geometries() if g.name == "bystander"]
+    assert bystander.position_m == pytest.approx((0.5, 0.5, 0.03))
+
+    handle.randomize_props(["a"], REGION, seed=1, size_range_m={"a": (0.04, 0.04)})
+    (bystander,) = [g for g in handle.prop_geometries() if g.name == "bystander"]
+    assert bystander.position_m == pytest.approx((0.1, 0.2, 0.03))
+
+
 def test_sample_prop_positions_restarts_stranded_layouts():
     """GPU run 8: with per-prop-only retries, seed 6 strands the third cube in
     the demo cell's exact region. A stranded layout must be redrawn whole."""
@@ -386,3 +576,27 @@ def test_sample_prop_positions_restarts_stranded_layouts():
                     positions[i][0] - positions[j][0], positions[i][1] - positions[j][1]
                 )
                 assert gap >= 0.2
+
+
+def test_six_block_cell_scatter_succeeds_at_the_measured_separation():
+    """Six-block fragment packing envelope (phase-2 seam decision): 60 mm
+    cubes in the scatter region at 140 mm separation place all six on every
+    seed, matching the measured 100/100 success rate this default relies on."""
+    dims = {
+        name: (0.06, 0.06, 0.06)
+        for name in (
+            "pick_cube",
+            "ignore_cube_green",
+            "ignore_cube_blue",
+            "ignore_cube_yellow",
+            "ignore_cube_purple",
+            "ignore_cube_orange",
+        )
+    }
+    region = ((0.45, -0.25, 0.75), (0.70, 0.25, 0.75))
+    successes = 0
+    for seed in range(100):
+        placed = sample_prop_positions(dims, region, seed=seed, min_separation_m=0.14)
+        assert set(placed) == set(dims)
+        successes += 1
+    assert successes == 100

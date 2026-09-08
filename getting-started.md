@@ -22,11 +22,11 @@ These instructions were tested with:
 
 In the 'configure' tab of the web UI, hit the '+' button or tap 'A', then tap 'B' for blocks, then find the `isaac-sim-pick-and-place` fragment from the `viam-dev` org (it pulls in the private `viam:isaac-sim-devin` registry module — the machine must be in `viam-dev` to see it) and install it. Click 'Save' in the top right.
 
-The fragment card has a 'Variables' section with five entries: `table-height-m`, `pick-block-color`, `distractor-color-green`, `distractor-color-blue`, and `detect-color`. Each one has a default value. Leave them all unset for your first run. The defaults boot the exact shipped cell: a table, a red block to pick, a green and a blue distractor block, and a place pad.
+The fragment card has a 'Variables' section with nine entries: `table-height-m`, `pick-block-color`, `distractor-color-green`, `distractor-color-blue`, `distractor-color-yellow`, `distractor-color-purple`, `distractor-color-orange`, `detect-color`, and `hue-tolerance-pct`. Each one has a default value. Leave them all unset for your first run. The defaults boot the exact shipped cell: a table, a red block to pick, five distractor blocks (green, blue, yellow, purple, orange), and a place pad.
 
 Switch to the 'logs' tab to watch the installed components start up. On the test machine this takes around 15 seconds. You'll see an 'event=complete' event from the rdk.activity logger when this is done.
 
-Now switch to the 'control' tab to interact with the cameras and arm. Open the `scene-cam` livestream. You should see a table with three colored blocks on it (red, green, blue) and a UR5e arm with a gripper mounted at one corner of the table. If the table, blocks, or arm are missing, something failed during boot. Check the logs tab before continuing.
+Now switch to the 'control' tab to interact with the cameras and arm. The cell has three cameras: `wrist-cam` (rides the arm's flange), `scene-cam` (a fixed overview), and `side-cam` (a fixed camera across the table, used to measure the tallest block). Open the `scene-cam` livestream. You should see a table with six colored blocks on it (red, green, blue, yellow, purple, orange) and a UR5e arm with a gripper mounted at one corner of the table. If the table, blocks, or arm are missing, something failed during boot. Check the logs tab before continuing.
 
 If something goes wrong, the place to debug is the logs tab; to cut down on noise, find the components list on the left-side menu bar and click the `viam_isaac-sim-devin` module (or whatever you named the local module) to filter down the output.
 
@@ -45,11 +45,13 @@ First, find your connection details. In the web UI, go to the 'connect' tab and 
 Then run:
 
 ```
-.venv/bin/python examples/pick_red_block.py --address <machine-address> --api-key <key> --api-key-id <key-id> --support-z-mm 750
+.venv/bin/python examples/pick_red_block.py --address <machine-address> --api-key <key> --api-key-id <key-id> --support-z-mm 750 --randomize-seed <n> --randomize-size-mm 40,90
 ```
 
 `--support-z-mm 750` tells the script the block rests 750 mm up, on top of the table, instead of on the floor. The table itself is already a motion obstacle: the sim world serves every prop's geometry to the planner live, so no extra flag is needed.
 
-To scatter the three blocks into a different layout before the pick, add `--randomize-seed <n>` with any integer. Leave it off to use the fragment's fixed starting layout.
+`--randomize-seed <n>` (any integer) scatters the six blocks into a new layout before the pick. `--randomize-size-mm 40,90` also redraws each block's size in that 40-90 mm range; in the `scene-cam` livestream, the blocks visibly change size between runs. Leave both off to use the fragment's fixed starting layout and sizes.
 
-On success, the script prints a line starting with `PLACED_BLOCK_JSON=` followed by a JSON object with `"placed_on_pad": true`. That means the arm found the red block, picked it up, and set it down on the place pad.
+On success, the script prints several marker lines: `MEASURED_BLOCK_JSON=` with the target block's own measured footprint and height, `MEASURED_TALLEST_JSON=` with the tallest scattered object's measured height (`"source": "side"` when the fixed side camera made the measurement), and finally `PLACED_BLOCK_JSON=` with `"placed_on_pad": true`. That last one means the arm found the red block, picked it up, cleared every other block on the way, and set it down on the place pad.
+
+If the randomized target measures over 75 mm, the script refuses the grasp cleanly and leaves the arm parked instead of attempting a doomed pick - that's correct behavior for an oversize block, not a failure.

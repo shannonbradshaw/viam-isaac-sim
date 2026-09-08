@@ -1,4 +1,4 @@
-"""Unit tests for the pure helpers in examples/gpu_checklist_phase2.py.
+"""Unit tests for the pure helpers in examples/gpu_checklist_camera.py.
 
 The module lives under examples/ (not a package under src/) and must not be
 imported by anything in src/isaac_module (it runs on a laptop against a
@@ -12,22 +12,22 @@ from pathlib import Path
 
 import pytest
 
-_MODULE_PATH = Path(__file__).resolve().parent.parent / "examples" / "gpu_checklist_phase2.py"
-_spec = importlib.util.spec_from_file_location("gpu_checklist_phase2", _MODULE_PATH)
+_MODULE_PATH = Path(__file__).resolve().parent.parent / "examples" / "gpu_checklist_camera.py"
+_spec = importlib.util.spec_from_file_location("gpu_checklist_camera", _MODULE_PATH)
 assert _spec is not None and _spec.loader is not None
-gpu_checklist_phase2 = importlib.util.module_from_spec(_spec)
-sys.modules["gpu_checklist_phase2"] = gpu_checklist_phase2
-_spec.loader.exec_module(gpu_checklist_phase2)
+gpu_checklist_camera = importlib.util.module_from_spec(_spec)
+sys.modules["gpu_checklist_camera"] = gpu_checklist_camera
+_spec.loader.exec_module(gpu_checklist_camera)
 
-parse_xyz = gpu_checklist_phase2.parse_xyz
-red_bbox = gpu_checklist_phase2.red_bbox
-raised_bbox = gpu_checklist_phase2.raised_bbox
-depth_stats = gpu_checklist_phase2.depth_stats
-region_center = gpu_checklist_phase2.region_center
-pose_delta_mm = gpu_checklist_phase2.pose_delta_mm
-is_reddish = gpu_checklist_phase2.is_reddish
-verdict = gpu_checklist_phase2.verdict
-skip = gpu_checklist_phase2.skip
+parse_xyz = gpu_checklist_camera.parse_xyz
+red_bbox = gpu_checklist_camera.red_bbox
+raised_bbox = gpu_checklist_camera.raised_bbox
+depth_stats = gpu_checklist_camera.depth_stats
+region_center = gpu_checklist_camera.region_center
+pose_delta_mm = gpu_checklist_camera.pose_delta_mm
+is_reddish = gpu_checklist_camera.is_reddish
+verdict = gpu_checklist_camera.verdict
+skip = gpu_checklist_camera.skip
 
 
 def test_parse_xyz():

@@ -76,7 +76,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import numpy as np
@@ -116,6 +116,7 @@ GRAB_DIAGNOSTICS_MARKER = "GRAB_DIAGNOSTICS_JSON="
 MOVE_DIAGNOSTICS_MARKER = "MOVE_DIAGNOSTICS_JSON="
 HOLD_SAMPLES_MARKER = "HOLD_SAMPLES_JSON="
 RESET_MID_HOLD_MARKER = "RESET_MID_HOLD_JSON="
+MEASURED_BLOCK_MARKER = "MEASURED_BLOCK_JSON="
 
 # checklist item 5 wants the block held 100 mm up for 5 s; item 6 resets the
 # world mid-hold and expects the post-reset hooks (ARM-15/XC-5) to keep it held
@@ -206,6 +207,11 @@ def grasp_height_mm(
     centre_floor = support_z_mm + block_size_mm / 2.0
     fingertip_floor = support_z_mm + fingertip_overhang_mm + clearance_mm
     return max(detected_z_mm, centre_floor, fingertip_floor)
+
+
+# 2F-85 opens 85 mm (W13/W15); 10 mm covers the closed fingers' own
+# clearance, so a measured block wider than this cannot be grasped.
+JAW_MAX_BLOCK_MM = 75.0
 
 
 # The frame system and Isaac disagree by ~17-19 mm in z at the grasp
@@ -364,9 +370,11 @@ CARRY_CLEAR_ABOVE_SUPPORT_MM = 200.0
 
 def pick_area_keepout(
     region_mm: tuple[Sequence[float], Sequence[float]],
+    height_mm: float = KEEPOUT_HEIGHT_MM,
 ) -> Geometry:
     """The carry-phase no-fly box over the scatter region: from the region's
-    own z (the support surface) up KEEPOUT_HEIGHT_MM, grown by
+    own z (the support surface) up ``height_mm`` (KEEPOUT_HEIGHT_MM by
+    default; phase 4 passes the measured-tallest-derived height), grown by
     KEEPOUT_MARGIN_MM sideways."""
     (x0, y0, z0), (x1, y1, _z1) = region_mm
     lo_x = min(x0, x1) - KEEPOUT_MARGIN_MM
@@ -377,18 +385,19 @@ def pick_area_keepout(
         center=Pose(
             x=(lo_x + hi_x) / 2.0,
             y=(lo_y + hi_y) / 2.0,
-            z=z0 + KEEPOUT_HEIGHT_MM / 2.0,
+            z=z0 + height_mm / 2.0,
             o_x=0.0,
             o_y=0.0,
             o_z=1.0,
             theta=0.0,
         ),
         box=RectangularPrism(
-            dims_mm=Vector3(x=hi_x - lo_x, y=hi_y - lo_y, z=KEEPOUT_HEIGHT_MM)
+            dims_mm=Vector3(x=hi_x - lo_x, y=hi_y - lo_y, z=height_mm)
         ),
         label="pick_area_keepout",
     )
 PLACED_BLOCK_MARKER = "PLACED_BLOCK_JSON="
+MEASURED_TALLEST_MARKER = "MEASURED_TALLEST_JSON="
 # refine the look when the detected block sits farther than this from the scan
 # centre; closer than this, a second measurement gains nothing
 FOCUS_LOOK_OFFSET_MM = 30.0
@@ -407,6 +416,167 @@ SCAN_ATTEMPTS = (
     (150.0, 150.0, 0.0),
     (-150.0, -150.0, 0.0),
 )
+
+# tallest-estimator trust thresholds (seam: phase-4-tallest-carry.md, "Client
+# measurement API")
+# the fragment segmenter's segment_size_px: 100, the cell's smallest-credible-
+# object constant - fewer in-region above-support points is not a block
+MIN_TALLEST_REGION_POINTS = 100
+# points at/below the support plus this are sensor noise, not object height
+TALLEST_SUPPORT_EPSILON_MM = 1.0
+# a 30 mm face at 900 mm range through 848 px / 90.5 deg intrinsics yields
+# hundreds of points, so requiring 5 within this band of the max z is
+# conservative - a lone stray point is not a block top
+TALLEST_TOP_BAND_MM = 10.0
+MIN_TALLEST_TOP_POINTS = 5
+
+
+@dataclass
+class TallestEstimate:
+    tallest_mm: float
+    points: int  # in-region points above the support plane
+    trusted: bool
+    reasons: list[str]  # empty when trusted
+
+
+def tallest_in_region_mm(
+    xyz_world_mm: np.ndarray,
+    region_mm: tuple[Sequence[float], Sequence[float]] | None,
+    support_z_mm: float,
+    size_range_mm: tuple[float, float],
+) -> TallestEstimate:
+    """Tallest object height above ``support_z_mm`` in ``xyz_world_mm``
+    (world frame, mm): clipped to ``region_mm``'s x/y footprint when given
+    (None skips the clip and the quadrant-coverage check below), points at or
+    below the support dropped before taking the max. Four independent trust
+    checks each append a distinct reason on failure; ``trusted`` is true only
+    when none do."""
+    if region_mm is not None:
+        (x0, y0, _z0), (x1, y1, _z1) = region_mm
+        lo_x, hi_x = min(x0, x1), max(x0, x1)
+        lo_y, hi_y = min(y0, y1), max(y0, y1)
+        in_region = (
+            (xyz_world_mm[:, 0] >= lo_x)
+            & (xyz_world_mm[:, 0] <= hi_x)
+            & (xyz_world_mm[:, 1] >= lo_y)
+            & (xyz_world_mm[:, 1] <= hi_y)
+        )
+        region_points = xyz_world_mm[in_region]
+    else:
+        region_points = xyz_world_mm
+
+    reasons: list[str] = []
+
+    if region_mm is not None:
+        mid_x = (lo_x + hi_x) / 2.0
+        mid_y = (lo_y + hi_y) / 2.0
+        # counted BEFORE the support drop: a quadrant shadowed by a near
+        # block has no support returns either - the side view's real failure
+        quadrant_counts = [
+            int(
+                (
+                    (region_points[:, 0] < mid_x if left else region_points[:, 0] >= mid_x)
+                    & (region_points[:, 1] < mid_y if bottom else region_points[:, 1] >= mid_y)
+                ).sum()
+            )
+            for left in (True, False)
+            for bottom in (True, False)
+        ]
+        if any(count < 1 for count in quadrant_counts):
+            reasons.append("region-quadrant coverage: a footprint quadrant has no in-region points")
+
+    above_support = region_points[:, 2] > support_z_mm + TALLEST_SUPPORT_EPSILON_MM
+    above_points = region_points[above_support]
+    points = int(len(above_points))
+    if points < MIN_TALLEST_REGION_POINTS:
+        reasons.append(
+            f"point floor: {points} in-region above-support points < {MIN_TALLEST_REGION_POINTS}"
+        )
+
+    tallest_mm = float(above_points[:, 2].max()) - support_z_mm if points > 0 else 0.0
+
+    lo_size, hi_size = size_range_mm
+    widened_lo = lo_size - DETECT_Z_TOLERANCE_MM
+    widened_hi = hi_size + DETECT_Z_TOLERANCE_MM
+    if not (widened_lo <= tallest_mm <= widened_hi):
+        reasons.append(
+            f"size window: tallest {tallest_mm:.1f} mm outside [{widened_lo:.1f}, {widened_hi:.1f}]"
+        )
+
+    near_top = (
+        int((above_points[:, 2] >= float(above_points[:, 2].max()) - TALLEST_TOP_BAND_MM).sum())
+        if points > 0
+        else 0
+    )
+    if near_top < MIN_TALLEST_TOP_POINTS:
+        reasons.append(
+            f"lone-point top: {near_top} points within {TALLEST_TOP_BAND_MM} mm of the max z "
+            f"< {MIN_TALLEST_TOP_POINTS}"
+        )
+
+    return TallestEstimate(tallest_mm=tallest_mm, points=points, trusted=not reasons, reasons=reasons)
+
+
+# keep-out/carry derivation (seam): tallest + held-cube hang + margin. The
+# hang fraction reproduces today's GPU-validated 60 mm-block numbers
+# (keepout_height_mm(60, 60) == 130, carry_clear_above_support_mm(60, 60) ==
+# 200); a held cube of a different size re-validates on GPU (phase 4
+# checklist item 2).
+KEEPOUT_HELD_HANG_FRACTION = 1.0 / 3.0
+# the held padded cube's bottom clears the keep-out ceiling by this much once
+# carried (GPU run 12: "~20 mm to spare" for the 60 mm case)
+CARRY_KEEPOUT_CLEARANCE_MM = 21.0
+# believed-vs-physical TCP gap already named at CARRY_CLEAR_ABOVE_SUPPORT_MM's
+# definition (ARM-10)
+CARRY_TCP_TO_CUBE_BOTTOM_OFFSET_MM = 9.0
+
+
+def keepout_height_mm(tallest_mm: float, held_size_mm: float) -> float:
+    """Pick-area keep-out ceiling height above the support: the tallest
+    scattered object, plus room for the held cube's hang, plus
+    KEEPOUT_MARGIN_MM reused as vertical margin."""
+    return tallest_mm + held_size_mm * KEEPOUT_HELD_HANG_FRACTION + KEEPOUT_MARGIN_MM
+
+
+def carry_clear_above_support_mm(tallest_mm: float, held_size_mm: float) -> float:
+    """TCP height for the free-carry hop: the keep-out ceiling top, plus
+    CARRY_KEEPOUT_CLEARANCE_MM, plus the held padded cube's own half-height
+    and TCP offset so its bottom face clears the ceiling."""
+    half_padded_held_mm = (held_size_mm + HELD_BLOCK_PADDING_MM) / 2.0
+    return (
+        keepout_height_mm(tallest_mm, held_size_mm)
+        + CARRY_KEEPOUT_CLEARANCE_MM
+        + CARRY_TCP_TO_CUBE_BOTTOM_OFFSET_MM
+        + half_padded_held_mm
+    )
+
+
+TALLEST_SWEEP_CORNER_INSET_MM = 50.0
+
+
+def tallest_sweep_attempts(
+    region_mm: tuple[Sequence[float], Sequence[float]],
+) -> tuple[tuple[float, float, float], ...]:
+    """The wrist-sweep fallback ladder for tallest measurement: 4 region-corner
+    vantages (offsets from the region centre, inset
+    TALLEST_SWEEP_CORNER_INSET_MM from each corner, theta 0) FIRST, then
+    SCAN_ATTEMPTS. Corners lead because a region-centre vantage hangs the
+    camera's own gripper inside the region footprint, where it reads as a
+    ~274 mm object (GPU phase-4 run 1: all four centre vantages discarded);
+    a corner vantage keeps the arm outside the footprint."""
+    (x0, y0, _z0), (x1, y1, _z1) = region_mm
+    lo_x, hi_x = min(x0, x1), max(x0, x1)
+    lo_y, hi_y = min(y0, y1), max(y0, y1)
+    centre_x = (lo_x + hi_x) / 2.0
+    centre_y = (lo_y + hi_y) / 2.0
+    inset = TALLEST_SWEEP_CORNER_INSET_MM
+    corners = (
+        (lo_x + inset - centre_x, lo_y + inset - centre_y, 0.0),
+        (hi_x - inset - centre_x, lo_y + inset - centre_y, 0.0),
+        (lo_x + inset - centre_x, hi_y - inset - centre_y, 0.0),
+        (hi_x - inset - centre_x, hi_y - inset - centre_y, 0.0),
+    )
+    return corners + SCAN_ATTEMPTS
 
 
 def randomize_region_mm(
@@ -505,7 +675,7 @@ def held_block_transform(
 
 
 def is_red_point(rgb: tuple[int, int, int], threshold: float = 0.5) -> bool:
-    """Same rule as gpu_checklist_phase2.is_red_pixel: r is at least 100 and
+    """Same rule as gpu_checklist_camera.is_red_pixel: r is at least 100 and
     both g and b are at most `threshold` fractions of r."""
     r, g, b = rgb
     return r >= 100 and g <= r * threshold and b <= r * threshold
@@ -562,6 +732,54 @@ def top_face_centre_m(
             chosen = red_in_band
     centre = xyz[chosen].mean(axis=0)
     return (float(centre[0]), float(centre[1]), float(centre[2]))
+
+
+FOOTPRINT_TRIM_PCT_LO = 2.0
+FOOTPRINT_TRIM_PCT_HI = 98.0
+# a cube's three independent size readings (footprint x, footprint y,
+# height) should agree; a bigger spread means a shadowed or edge-on view,
+# not a block to grasp on (seam decision, phase 3)
+MEASURED_SIZE_DEGENERATE_FRACTION = 0.25
+
+
+def footprint_extents_mm(
+    xyz: np.ndarray, band_m: float = TOP_FACE_BAND_M
+) -> tuple[float, float] | None:
+    """Top-face x/y footprint (mm) of the focused segment: the segment is
+    already the detected block (the segmenter cuts it out of the detector's
+    box), so measure the nearest-depth band - the same points
+    top_face_centre_m trusts - each axis trimmed to the 2nd-98th percentile
+    so a stray point cannot blow out the extent. Never select by redness:
+    the lit top face washes out past any red test (GPU run 21; the phase-3
+    checklist run saw red: 0 on every top-down scan). None when no point
+    clears MIN_BLOCK_DEPTH_M."""
+    far_enough = xyz[:, 2] >= MIN_BLOCK_DEPTH_M
+    if not far_enough.any():
+        return None
+    nearest = float(xyz[far_enough, 2].min())
+    band_xy = xyz[far_enough & (xyz[:, 2] <= nearest + band_m), :2]
+    lo = np.percentile(band_xy, FOOTPRINT_TRIM_PCT_LO, axis=0)
+    hi = np.percentile(band_xy, FOOTPRINT_TRIM_PCT_HI, axis=0)
+    # the trim shaves 4% of a uniformly sampled extent (GPU: 57.3 mm measured
+    # on a true 60 mm face) - rescale so a clean face measures true size
+    trim_fraction = (FOOTPRINT_TRIM_PCT_HI - FOOTPRINT_TRIM_PCT_LO) / 100.0
+    extent_mm = (hi - lo) * MM_PER_M / trim_fraction
+    return (float(extent_mm[0]), float(extent_mm[1]))
+
+
+def measured_block_size_mm(estimates: Sequence[float]) -> tuple[float, list[float]] | None:
+    """Cube-prior size estimate: the median of independent size readings (a
+    real detection uses footprint x, footprint y and height). None (a
+    degenerate view) when any estimate strays more than
+    MEASURED_SIZE_DEGENERATE_FRACTION of the median from it - advance the
+    scan ladder instead of grasping on a bad number."""
+    values = [float(v) for v in estimates]
+    if any(v <= 0 for v in values):
+        return None
+    size_mm = float(np.median(values))
+    if any(abs(v - size_mm) > MEASURED_SIZE_DEGENERATE_FRACTION * size_mm for v in values):
+        return None
+    return size_mm, values
 
 
 def segment_stats(
@@ -675,6 +893,37 @@ class WorldApi(Protocol):
         ...
 
 
+class TallestScanner(Protocol):
+    async def scan_world_mm(self) -> np.ndarray:
+        """World-frame mm points (N x 3) of the scanner's current view, fed
+        to ``tallest_in_region_mm``."""
+        ...
+
+
+async def camera_world_transform_mm(robot: Any, camera_name: str) -> tuple[np.ndarray, np.ndarray]:
+    """(R 3x3, t mm) camera-to-world affine from 4 ``transform_pose`` probes:
+    the camera-frame origin and +100 mm x/y/z offsets. Applied as
+    ``world_mm = xyz_cam_m * 1000 @ R.T + t`` - no orientation-vector math,
+    just the measured effect of the frame transform on known offsets."""
+
+    async def probe(x_mm: float, y_mm: float, z_mm: float) -> np.ndarray:
+        camera_pif = PoseInFrame(
+            reference_frame=camera_name,
+            pose=Pose(x=x_mm, y=y_mm, z=z_mm, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0),
+        )
+        pose = (await robot.transform_pose(camera_pif, "world")).pose
+        return np.array([pose.x, pose.y, pose.z])
+
+    origin = await probe(0.0, 0.0, 0.0)
+    x_probe = await probe(100.0, 0.0, 0.0)
+    y_probe = await probe(0.0, 100.0, 0.0)
+    z_probe = await probe(0.0, 0.0, 100.0)
+    rotation = np.column_stack(
+        [(x_probe - origin) / 100.0, (y_probe - origin) / 100.0, (z_probe - origin) / 100.0]
+    )
+    return rotation, origin
+
+
 @dataclass
 class PickPipeline:
     """W36's sequence: look -> detect -> open -> pre-grasp -> grasp -> grab -> lift ->
@@ -685,7 +934,9 @@ class PickPipeline:
     mover: Mover
     gripper: GripperApi
     block_name: str
-    block_size_mm: float
+    # None = measure from the focused segment's point cloud (the default);
+    # a float overrides the measurement end to end (today's fixed-size path)
+    block_size_mm: float | None
     gripper_name: str
     table: Geometry | None = None  # W4's table exists only in the P5 cell: opt in with --table
     other_blocks: Sequence[Geometry] = ()
@@ -699,9 +950,14 @@ class PickPipeline:
     movable_prop_names: Sequence[str] = ()
     randomize_seed: int | None = None  # checklist item 1: re-randomise before this pick
     randomize_region_mm: tuple[Sequence[float], Sequence[float]] | None = None
-    # FINDINGS W26: scattered blocks stay >= 200 mm apart, so the gripper can
-    # descend on any one of them without clipping a neighbour
-    randomize_min_separation_mm: float = 200.0
+    # adds size_range_mm to the randomize_props payload for every movable
+    # name (None = today's payload, byte-identical)
+    randomize_size_range_mm: tuple[float, float] | None = None
+    # Measured over seeds 0-99, six 60 mm cubes in [450, 700] x [-250, 250] mm:
+    # 200 mm succeeds 0/100, 140 mm succeeds 100/100. W26's gripper-clearance
+    # intent still holds at 140 (worst-case face gap 80 mm vs 12.5 mm jaw
+    # overhang; the 2F-85 opens 85 mm).
+    randomize_min_separation_mm: float = 140.0
     # centre of the scatter region a randomize run used; the camera scans the
     # workspace from above it - the DETECTOR finds the block, never sim truth
     scan_centre_mm: tuple[float, float] | None = None
@@ -732,6 +988,29 @@ class PickPipeline:
     # checklist item 6: called mid-hold to reset the world; must report
     # holding_before_reset/holding_after_reset (None = no reset probe)
     mid_hold_reset: Callable[[], Awaitable[dict[str, Any]]] | None = None
+    # set by _detect_block once a detection is accepted: block_size_mm when
+    # explicit, else the measured size - every downstream consumer reads
+    # this, never block_size_mm directly
+    resolved_block_size_mm: float | None = None
+    # phase 4: primary/fallback tallest-object scanners, run only when
+    # randomize_size_range_mm is set (dynamic keep-out/carry heights)
+    side_scanner: TallestScanner | None = None
+    wrist_scanner: TallestScanner | None = None
+    # set by _sim_obstacles from the randomize response's sizes_mm (log-only
+    # ground truth - the control path never consumes it): max drawn z-dim,
+    # None without a sizes-bearing response
+    drawn_tallest_mm: float | None = None
+    # set by _measure_tallest: the trusted-or-fallback tallest estimate, its
+    # source, and the wrist-sweep vantages tried - fed into the derived
+    # keep-out/carry heights once the held size is known (_run_steps, after
+    # the jaw check) and printed in MEASURED_TALLEST_JSON
+    tallest_estimate: TallestEstimate | None = None
+    tallest_source: str | None = None
+    tallest_scan_poses_mm: list[dict[str, float]] = field(default_factory=list)
+    # set alongside the marker: the derived heights that replace
+    # KEEPOUT_HEIGHT_MM / CARRY_CLEAR_ABOVE_SUPPORT_MM for this pick
+    measured_keepout_height_mm: float | None = None
+    measured_carry_clear_above_support_mm: float | None = None
 
     async def _move_or_diagnose(
         self, pose: Pose, move_world_state: WorldState, linear: bool = False
@@ -768,25 +1047,96 @@ class PickPipeline:
                     f"step: randomize props (checklist item 1, seed {self.randomize_seed}, "
                     f"names {names}, region {region})"
                 )
-                response = await self.world.do_command(
-                    {
-                        "command": "randomize_props",
-                        "names": names,
-                        "region": [list(region[0]), list(region[1])],
-                        "seed": self.randomize_seed,
-                        "min_separation": self.randomize_min_separation_mm,
-                    }
-                )
+                randomize_command: dict[str, Any] = {
+                    "command": "randomize_props",
+                    "names": names,
+                    "region": [list(region[0]), list(region[1])],
+                    "seed": self.randomize_seed,
+                    "min_separation": self.randomize_min_separation_mm,
+                }
+                if self.randomize_size_range_mm is not None:
+                    randomize_command["size_range_mm"] = list(self.randomize_size_range_mm)
+                response = await self.world.do_command(randomize_command)
                 (x0, y0, _z0), (x1, y1, _z1) = region
                 self.scan_centre_mm = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
                 self.pick_region_mm = region
                 print(f"  scattered: {sorted(response.get('positions') or {})}")
+                # log-only ground truth: the pipeline never consumes these
+                # dims (the camera measures the target), but the log showing
+                # them is what proves a size range was actually applied
+                sizes_mm = response.get("sizes_mm") or {}
+                if sizes_mm:
+                    rounded = {
+                        name: [round(float(v), 1) for v in dims]
+                        for name, dims in sorted(sizes_mm.items())
+                    }
+                    print(f"  sizes (mm, module-reported): {rounded}")
+                    self.drawn_tallest_mm = max(float(dims[2]) for dims in sizes_mm.values())
         response = await self.world.do_command({"command": "prop_geometries"})
         geometries = response.get("geometries", [])
         if self.place_prop_name is not None:
             self.place_pad_top_mm = pad_top_centre_mm(geometries, self.place_prop_name)
         exclude = {self.target_prop_name} if self.target_prop_name else set()
         return obstacles_from_prop_geometries(geometries, exclude)
+
+    async def _measure_tallest(self, move_world_state: WorldState) -> None:
+        """Tallest-object measurement (phase 4): side scan first (occlusion-
+        proof except for a nearer silhouette hiding a farther block), then
+        the wrist-sweep ladder when the side scan is untrusted, then the
+        size-range max as a conservative last resort. ``verify_detection_height``
+        doubles as the mock/real switch (the existing convention): mock skips
+        the region clip and reads the support at 0 (seam's mock mapping)."""
+        assert self.randomize_size_range_mm is not None
+        mock = not self.verify_detection_height
+        region_mm = None if mock else self.pick_region_mm
+        support_z_mm = 0.0 if mock else self.support_z_mm
+
+        if self.side_scanner is not None:
+            points = await self.side_scanner.scan_world_mm()
+            estimate = tallest_in_region_mm(
+                points, region_mm, support_z_mm, self.randomize_size_range_mm
+            )
+            print(f"  tallest side scan: {estimate}")
+            if estimate.trusted:
+                self.tallest_estimate = estimate
+                self.tallest_source = "side"
+                return
+
+        if (
+            self.wrist_scanner is not None
+            and self.look_pose is not None
+            and self.scan_centre_mm is not None
+            and self.pick_region_mm is not None
+        ):
+            for offset_x, offset_y, wrist_theta_deg in tallest_sweep_attempts(self.pick_region_mm):
+                vantage = _pointing_down(
+                    self.scan_centre_mm[0] + offset_x,
+                    self.scan_centre_mm[1] + offset_y,
+                    self.look_pose.z,
+                    theta_deg=wrist_theta_deg,
+                )
+                print(f"step: tallest wrist sweep vantage: {_pose_to_dict(vantage)}")
+                await self.mover.look_from(vantage, move_world_state)
+                self.tallest_scan_poses_mm.append(_pose_to_dict(vantage))
+                points = await self.wrist_scanner.scan_world_mm()
+                estimate = tallest_in_region_mm(
+                    points, region_mm, support_z_mm, self.randomize_size_range_mm
+                )
+                print(f"  tallest wrist sweep attempt: {estimate}")
+                if estimate.trusted:
+                    self.tallest_estimate = estimate
+                    self.tallest_source = "wrist_sweep"
+                    return
+
+        lo_mm, hi_mm = self.randomize_size_range_mm
+        print(
+            "  WARNING: tallest measurement untrusted from every vantage - falling back to "
+            f"the size-range max {hi_mm:.1f} mm as a conservative keep-out ceiling"
+        )
+        self.tallest_estimate = TallestEstimate(
+            tallest_mm=hi_mm, points=0, trusted=False, reasons=["no trusted scan"]
+        )
+        self.tallest_source = "fallback"
 
     async def _place(
         self,
@@ -809,9 +1159,12 @@ class PickPipeline:
         if carry_world_state is not None:
             # keep-out carry (GPU run 12): hop above the no-fly box, then let
             # the planner move freely - it cannot enter the block airspace
-            clear = _pointing_down(
-                lift.x, lift.y, self.support_z_mm + CARRY_CLEAR_ABOVE_SUPPORT_MM
+            clear_above_support_mm = (
+                self.measured_carry_clear_above_support_mm
+                if self.measured_carry_clear_above_support_mm is not None
+                else CARRY_CLEAR_ABOVE_SUPPORT_MM
             )
+            clear = _pointing_down(lift.x, lift.y, self.support_z_mm + clear_above_support_mm)
             print(f"step: raise above the pick-area keep-out: {_pose_to_dict(clear)}")
             await self._move_or_diagnose(clear, held_world_state, linear=True)
             print(f"step: carry to pre-place (free, keep-out boxed): {_pose_to_dict(pre_place)}")
@@ -884,7 +1237,8 @@ class PickPipeline:
             print(f"  placement: prop {block_name!r} not found in prop_geometries")
             return
         pose = block["pose_in_world_mm"]
-        expected_z = pad_top_z + self.block_size_mm / 2.0
+        assert self.resolved_block_size_mm is not None
+        expected_z = pad_top_z + self.resolved_block_size_mm / 2.0
         placed_on_pad = (
             abs(pose["x"] - pad_x) <= PLACE_XY_TOLERANCE_MM
             and abs(pose["y"] - pad_y) <= PLACE_XY_TOLERANCE_MM
@@ -914,19 +1268,39 @@ class PickPipeline:
         finally:
             await self._set_ignored([])
 
-    def _expected_block_z_mm(self) -> float:
-        return self.support_z_mm + self.block_size_mm / 2.0
+    def _expected_block_z_mm(self, block_size_mm: float) -> float:
+        return self.support_z_mm + block_size_mm / 2.0
 
-    def _is_resting_height(self, pose: Pose) -> bool:
+    def _is_resting_height(self, pose: Pose, block_size_mm: float) -> bool:
         if not self.verify_detection_height:
             return True
-        return abs(pose.z - self._expected_block_z_mm()) <= DETECT_Z_TOLERANCE_MM
+        return abs(pose.z - self._expected_block_z_mm(block_size_mm)) <= DETECT_Z_TOLERANCE_MM
+
+    def _current_measurement(self) -> dict[str, Any] | None:
+        """The most recent measurement from the detector's last
+        ``block_pose_world`` call, or None when block_size_mm is explicit
+        (no measurement happens) or the detector offers none."""
+        if self.block_size_mm is not None:
+            return None
+        last_measurement = getattr(self.detector, "last_measurement", None)
+        return last_measurement() if last_measurement is not None else None
+
+    def _resolve_block_size_mm(self, measurement: dict[str, Any] | None) -> float | None:
+        """The size in effect for this detection: block_size_mm when
+        explicit, else the measured size, or None when the view was
+        degenerate (no measurement to grasp on)."""
+        if self.block_size_mm is not None:
+            return self.block_size_mm
+        return measurement["size_mm"] if measurement is not None else None
 
     async def _detect_block(self, move_world_state: WorldState) -> Pose:
         """Scan, detect, focus, and sanity-check the red block's pose. A
         detection whose height cannot be a resting block means the gripper's
         shadow swallowed it (GPU run 10: z 115 for a 60 mm cube), so the scan
-        walks SCAN_ATTEMPTS instead of grasping at a phantom."""
+        walks SCAN_ATTEMPTS instead of grasping at a phantom. When
+        block_size_mm is None, a degenerate size measurement (footprint and
+        height disagreeing) walks the same ladder instead of grasping on a
+        bad number (phase 3 seam decision)."""
         for offset_x, offset_y, wrist_theta_deg in SCAN_ATTEMPTS:
             look_pose = self.look_pose
             if look_pose is not None and self.scan_centre_mm is not None:
@@ -943,10 +1317,22 @@ class PickPipeline:
             print("step: detect (from the stationary look pose)")
             block_pose = await self.detector.block_pose_world()
             print(f"  block_pose_world (mm): {_pose_to_dict(block_pose)}")
+            detect_pose = look_pose
+            measurement = self._current_measurement()
+            block_size_mm = self._resolve_block_size_mm(measurement)
+            if block_size_mm is None:
+                print(
+                    "  degenerate size measurement (footprint/height disagree by more "
+                    f"than {MEASURED_SIZE_DEGENERATE_FRACTION:.0%} of the median) - "
+                    "re-scanning"
+                )
+                if self.scan_centre_mm is None:
+                    break
+                continue
             if (
                 look_pose is not None
                 and self.scan_centre_mm is not None
-                and self._is_resting_height(block_pose)
+                and self._is_resting_height(block_pose, block_size_mm)
                 and math.hypot(block_pose.x - look_pose.x, block_pose.y - look_pose.y)
                 > FOCUS_LOOK_OFFSET_MM
             ):
@@ -960,13 +1346,30 @@ class PickPipeline:
                 print("step: detect (focused)")
                 block_pose = await self.detector.block_pose_world()
                 print(f"  block_pose_world (mm): {_pose_to_dict(block_pose)}")
-            if self._is_resting_height(block_pose):
+                detect_pose = focus
+                measurement = self._current_measurement()
+                block_size_mm = self._resolve_block_size_mm(measurement)
+                if block_size_mm is None:
+                    print(
+                        "  degenerate size measurement (footprint/height disagree by "
+                        f"more than {MEASURED_SIZE_DEGENERATE_FRACTION:.0%} of the "
+                        "median) - re-scanning"
+                    )
+                    if self.scan_centre_mm is None:
+                        break
+                    continue
+            if self._is_resting_height(block_pose, block_size_mm):
                 print(f"{DETECTED_BLOCK_POSE_MARKER}{json.dumps(_pose_to_dict(block_pose))}")
+                self.resolved_block_size_mm = block_size_mm
+                if measurement is not None:
+                    report = dict(measurement)
+                    report["scan_pose_mm"] = _pose_to_dict(detect_pose) if detect_pose else None
+                    print(f"{MEASURED_BLOCK_MARKER}{json.dumps(report, default=str, sort_keys=True)}")
                 return block_pose
             print(
                 f"  implausible detection: z {block_pose.z:.1f} vs expected "
-                f"{self._expected_block_z_mm():.1f} mm for a resting block - the "
-                "gripper likely shadows it; re-scanning from an offset pose"
+                f"{self._expected_block_z_mm(block_size_mm):.1f} mm for a resting block "
+                "- the gripper likely shadows it; re-scanning from an offset pose"
             )
             if self.scan_centre_mm is None:
                 break
@@ -984,15 +1387,61 @@ class PickPipeline:
         move_world_state = world_state(
             self.table, (*self.other_blocks, *sim_obstacles), support_obstacle(self.support_z_mm)
         )
+        if self.randomize_size_range_mm is not None:
+            await self._measure_tallest(move_world_state)
         block_pose = await self._detect_block(move_world_state)
+        assert self.resolved_block_size_mm is not None
+        block_size_mm = self.resolved_block_size_mm
+        if self.randomize_size_range_mm is not None:
+            lo_mm, hi_mm = self.randomize_size_range_mm
+            if not (lo_mm - DETECT_Z_TOLERANCE_MM <= block_size_mm <= hi_mm + DETECT_Z_TOLERANCE_MM):
+                print(
+                    f"  WARNING: measured size {block_size_mm:.1f} mm falls outside the "
+                    f"--randomize-size-mm range [{lo_mm:.1f}, {hi_mm:.1f}] mm "
+                    f"(+/- {DETECT_Z_TOLERANCE_MM:.0f} mm tolerance)"
+                )
+        print(f"step: jaw check ({block_size_mm:.1f} mm measured vs {JAW_MAX_BLOCK_MM:.0f} mm jaw)")
+        if block_size_mm > JAW_MAX_BLOCK_MM:
+            raise RuntimeError(
+                f"target block measures {block_size_mm:.1f} mm, wider than the gripper's "
+                f"{JAW_MAX_BLOCK_MM:.0f} mm jaw limit (2F-85 85 mm open - 10 mm finger "
+                "clearance) - refusing the grasp, arm left parked"
+            )
+
+        if self.tallest_estimate is not None:
+            self.measured_keepout_height_mm = keepout_height_mm(
+                self.tallest_estimate.tallest_mm, block_size_mm
+            )
+            self.measured_carry_clear_above_support_mm = carry_clear_above_support_mm(
+                self.tallest_estimate.tallest_mm, block_size_mm
+            )
+            drawn_delta_mm = (
+                self.tallest_estimate.tallest_mm - self.drawn_tallest_mm
+                if self.drawn_tallest_mm is not None
+                else None
+            )
+            marker = {
+                "tallest_mm": self.tallest_estimate.tallest_mm,
+                "source": self.tallest_source,
+                "trusted": self.tallest_estimate.trusted,
+                "reasons": self.tallest_estimate.reasons,
+                "points": self.tallest_estimate.points,
+                "scan_poses_mm": self.tallest_scan_poses_mm,
+                "keepout_height_mm": self.measured_keepout_height_mm,
+                "carry_clear_above_support_mm": self.measured_carry_clear_above_support_mm,
+                "drawn_tallest_mm": self.drawn_tallest_mm,
+                "drawn_delta_mm": drawn_delta_mm,
+            }
+            print(f"{MEASURED_TALLEST_MARKER}{json.dumps(marker, default=str, sort_keys=True)}")
+
         grasp_z = grasp_height_mm(
-            block_pose.z, self.block_size_mm, self.support_z_mm, self.fingertip_overhang_mm
+            block_pose.z, block_size_mm, self.support_z_mm, self.fingertip_overhang_mm
         )
         held_centre_below_tcp_mm = grasp_z - block_pose.z
         if grasp_z != block_pose.z:
             print(
                 f"  grasp height raised from {block_pose.z:.1f} to {grasp_z:.1f} mm "
-                f"(block size {self.block_size_mm:.0f}, support z {self.support_z_mm:.0f}, "
+                f"(block size {block_size_mm:.0f}, support z {self.support_z_mm:.0f}, "
                 f"fingertip overhang {self.fingertip_overhang_mm:.0f})"
             )
             block_pose = with_z(block_pose, grasp_z)
@@ -1031,13 +1480,13 @@ class PickPipeline:
 
         transform = held_block_transform(
             self.block_name,
-            self.block_size_mm,
+            block_size_mm,
             self.gripper_name,
             centre_below_tcp_mm=held_centre_below_tcp_mm,
         )
         padded_transform = held_block_transform(
             self.block_name,
-            self.block_size_mm + HELD_BLOCK_PADDING_MM,
+            block_size_mm + HELD_BLOCK_PADDING_MM,
             self.gripper_name,
             centre_below_tcp_mm=held_centre_below_tcp_mm,
         )
@@ -1049,9 +1498,18 @@ class PickPipeline:
         )
         carry_world_state = None
         if self.pick_region_mm is not None:
+            keepout_kwargs = (
+                {"height_mm": self.measured_keepout_height_mm}
+                if self.measured_keepout_height_mm is not None
+                else {}
+            )
             carry_world_state = world_state(
                 self.table,
-                (*self.other_blocks, *sim_obstacles, pick_area_keepout(self.pick_region_mm)),
+                (
+                    *self.other_blocks,
+                    *sim_obstacles,
+                    pick_area_keepout(self.pick_region_mm, **keepout_kwargs),
+                ),
                 support_obstacle(self.support_z_mm),
                 transforms=(padded_transform,),
             )
@@ -1119,15 +1577,30 @@ class PickPipeline:
 class RealDetector:
     """Block pose from the vision service's largest segment: the red points'
     top face gives x/y and the top height; the block centre is size/2 below
-    it. The segmenter's own centre is printed for comparison."""
+    it. The segmenter's own centre is printed for comparison.
+
+    ``block_size_mm`` None measures the size from the same segment
+    (footprint x/y extents plus top-face-minus-support height, cube-prior
+    median) instead of trusting a caller-supplied value; the measurement is
+    cached for ``last_measurement`` (None = explicit size, no measurement)."""
 
     def __init__(
-        self, robot: RobotClient, vision: VisionClient, camera_name: str, block_size_mm: float
+        self,
+        robot: RobotClient,
+        vision: VisionClient,
+        camera_name: str,
+        block_size_mm: float | None,
+        support_z_mm: float = 0.0,
     ) -> None:
         self._robot = robot
         self._vision = vision
         self._camera_name = camera_name
         self._block_size_mm = block_size_mm
+        self._support_z_mm = support_z_mm
+        self._last_measurement: dict[str, Any] | None = None
+
+    def last_measurement(self) -> dict[str, Any] | None:
+        return self._last_measurement
 
     async def block_pose_world(self) -> Pose:
         objects = await self._vision.get_object_point_clouds(self._camera_name)
@@ -1148,7 +1621,36 @@ class RealDetector:
             f"  segmenter centre (world, mm): {_pose_to_dict(segment_world)}; "
             f"top face centre: {_pose_to_dict(top_world)} from {len(xyz)} points"
         )
-        return with_z(top_world, top_world.z - self._block_size_mm / 2.0)
+        if self._block_size_mm is not None:
+            self._last_measurement = None
+            size_mm = self._block_size_mm
+        else:
+            footprint_mm = footprint_extents_mm(xyz)
+            height_mm = top_world.z - self._support_z_mm
+            measured = (
+                measured_block_size_mm([footprint_mm[0], footprint_mm[1], height_mm])
+                if footprint_mm is not None
+                else None
+            )
+            if measured is None:
+                if footprint_mm is None:
+                    print("  size estimates: no top-face band points")
+                else:
+                    print(
+                        f"  size estimates (mm): footprint [{footprint_mm[0]:.1f}, "
+                        f"{footprint_mm[1]:.1f}], height {height_mm:.1f} (top z - "
+                        f"support z {self._support_z_mm:.0f})"
+                    )
+                self._last_measurement = None
+                size_mm = 0.0  # degenerate: the caller re-scans and discards this pose
+            else:
+                size_mm, estimates = measured
+                self._last_measurement = {
+                    "footprint_mm": [footprint_mm[0], footprint_mm[1]],
+                    "height_mm": estimates[2],
+                    "size_mm": size_mm,
+                }
+        return with_z(top_world, top_world.z - size_mm / 2.0)
 
     async def _to_world(self, x_mm: float, y_mm: float, z_mm: float) -> Pose:
         camera_pif = PoseInFrame(
@@ -1277,6 +1779,27 @@ async def _camera_client(robot: RobotClient, camera_name: str) -> Any:
         ) from None
 
 
+class FixedCameraScanner:
+    """A ``TallestScanner`` over a real camera: grabs its point cloud, then
+    transforms the camera-frame points to world mm through the measured
+    camera->world affine (``camera_world_transform_mm``). Used both for the
+    fixed side camera (primary) and, aimed at a wrist-sweep vantage, the
+    wrist camera (fallback)."""
+
+    def __init__(self, robot: RobotClient, camera_name: str) -> None:
+        self._robot = robot
+        self._camera_name = camera_name
+
+    async def scan_world_mm(self) -> np.ndarray:
+        camera = await _camera_client(self._robot, self._camera_name)
+        pcd_bytes, _mime = await camera.get_point_cloud()
+        xyz_m, _rgb = parse_pcd(pcd_bytes)
+        rotation, translation = await camera_world_transform_mm(self._robot, self._camera_name)
+        world_mm = xyz_m * MM_PER_M @ rotation.T + translation
+        valid = ~np.isnan(world_mm).any(axis=1)
+        return world_mm[valid]
+
+
 async def _probe_depth(robot: RobotClient, args: argparse.Namespace, look_pose: Pose) -> None:
     """Move to the look pose, then compare the depth straight below the camera
     with the camera's commanded height above the support."""
@@ -1332,7 +1855,8 @@ async def _run_real(args: argparse.Namespace) -> Transform:
                 else default_scan_pose(args.support_z_mm)
             )
             await _probe_depth(robot, args, probe_pose)
-            return held_block_transform(args.block, args.block_size_mm, args.gripper)
+            probe_size_mm = args.block_size_mm if args.block_size_mm is not None else 0.0
+            return held_block_transform(args.block, probe_size_mm, args.gripper)
         await robot.refresh()  # the resource list is a snapshot from connect time
         vision = VisionClient.from_robot(robot, args.vision)
         motion = MotionClient.from_robot(robot, args.motion)
@@ -1340,8 +1864,17 @@ async def _run_real(args: argparse.Namespace) -> Transform:
         arm = Arm.from_robot(robot, args.arm)
         world = Generic.from_robot(robot, args.world)
 
+        # the wrist sweep must survive a disabled/missing side camera (GPU
+        # item 3: --tallest-camera "" went straight to the ceiling fallback)
+        side_scanner = (
+            FixedCameraScanner(robot, args.tallest_camera) if args.tallest_camera else None
+        )
+        wrist_scanner = FixedCameraScanner(robot, args.camera)
+
         pipeline = PickPipeline(
-            detector=RealDetector(robot, vision, args.camera, args.block_size_mm),
+            detector=RealDetector(
+                robot, vision, args.camera, args.block_size_mm, args.support_z_mm
+            ),
             mover=RealMover(motion, args.gripper, args.camera),
             gripper=gripper,
             block_name=args.block,
@@ -1354,6 +1887,9 @@ async def _run_real(args: argparse.Namespace) -> Transform:
             world=world,
             target_prop_name=args.block,
             randomize_seed=args.randomize_seed,
+            randomize_size_range_mm=args.randomize_size_mm,
+            side_scanner=side_scanner,
+            wrist_scanner=wrist_scanner,
             place_prop_name=None if args.no_place else args.place_pad,
             diagnose=lambda: _grab_diagnostics(arm, gripper, args.block),
             tcp_correction=(
@@ -1396,8 +1932,17 @@ _MOCK_JOINT_SETS_DEG = [
 
 
 class MockDetector:
-    def __init__(self, camera: Any) -> None:
+    """``block_size_mm`` None measures the size from the mock camera's own
+    red pixels (footprint x/y only - the mock scene is a flat depth plane
+    with no independent height axis to cross-check, unlike RealDetector)."""
+
+    def __init__(self, camera: Any, block_size_mm: float | None = None) -> None:
         self._camera = camera
+        self._block_size_mm = block_size_mm
+        self._last_measurement: dict[str, Any] | None = None
+
+    def last_measurement(self) -> dict[str, Any] | None:
+        return self._last_measurement
 
     async def block_pose_world(self) -> Pose:
         pcd_bytes, _ = await self._camera.get_point_cloud()
@@ -1418,7 +1963,39 @@ class MockDetector:
             "  mock detector: no frame system in mock mode - the camera-frame "
             f"centroid is treated as world frame: {_pose_to_dict(pose)}"
         )
+        if self._block_size_mm is not None:
+            self._last_measurement = None
+        else:
+            footprint_mm = footprint_extents_mm(xyz_m)
+            measured = (
+                measured_block_size_mm([footprint_mm[0], footprint_mm[1]])
+                if footprint_mm is not None
+                else None
+            )
+            self._last_measurement = (
+                {"footprint_mm": [footprint_mm[0], footprint_mm[1]], "height_mm": None, "size_mm": measured[0]}
+                if measured is not None
+                else None
+            )
         return pose
+
+
+class MockSideScanner:
+    """A ``TallestScanner`` over the mock side camera (seam's mock world
+    mapping, no frame system in mock mode):
+    ``xyz_world_mm = (x_cam, z_cam, -y_cam) * 1000``, NaN rows (no hit)
+    dropped."""
+
+    def __init__(self, camera: Any) -> None:
+        self._camera = camera
+
+    async def scan_world_mm(self) -> np.ndarray:
+        pcd_bytes, _mime = await self._camera.get_point_cloud()
+        xyz_cam_m, _rgb = parse_pcd(pcd_bytes)
+        x_cam, y_cam, z_cam = xyz_cam_m[:, 0], xyz_cam_m[:, 1], xyz_cam_m[:, 2]
+        world_mm = np.column_stack([x_cam, z_cam, -y_cam]) * MM_PER_M
+        valid = ~np.isnan(world_mm).any(axis=1)
+        return world_mm[valid]
 
 
 class MockMover:
@@ -1467,18 +2044,36 @@ async def _run_mock(args: argparse.Namespace) -> Transform:
     world_name = "mock-pick-world"
     arm_name = "mock-pick-arm"
     camera_name = "mock-wrist-cam"
+    side_camera_name = "mock-side-cam"
     gripper_name = "mock-pick-grip"
 
     world = IsaacWorld.new(config(world_name, {"mock": True}), {})
     arm = IsaacArm.new(config(arm_name, {"world": world_name, "asset": "ur5e"}), {})
-    camera = IsaacCamera.new(config(camera_name, {"world": world_name, "depth": True}), {})
+    camera_attrs: dict[str, Any] = {"world": world_name, "depth": True}
+    if args.mock_block_size_mm is not None:
+        camera_attrs["block_size_mm"] = args.mock_block_size_mm
+    camera = IsaacCamera.new(config(camera_name, camera_attrs), {})
+    # three distractors at distinct heights (45/90/60 mm), distinct columns
+    # and staggered depths so nothing overlaps in the fabricated side view
+    side_blocks = [
+        {"rgb": [200, 60, 60], "size_mm": 60.0, "height_mm": 45.0, "column_offset_px": -220, "depth_m": 0.80},
+        {"rgb": [60, 200, 60], "size_mm": 60.0, "height_mm": 90.0, "column_offset_px": 0, "depth_m": 0.90},
+        {"rgb": [60, 60, 200], "size_mm": 60.0, "height_mm": 60.0, "column_offset_px": 220, "depth_m": 1.00},
+    ]
+    side_camera = IsaacCamera.new(
+        config(
+            side_camera_name,
+            {"world": world_name, "depth": True, "view": "side", "blocks": side_blocks},
+        ),
+        {},
+    )
     gripper = IsaacGripper.new(
         config(gripper_name, {"world": world_name, "arm": arm_name, "mock_object_width_m": 0.05}),
         {},
     )
 
     pipeline = PickPipeline(
-        detector=MockDetector(camera),
+        detector=MockDetector(camera, args.block_size_mm),
         mover=MockMover(arm, _MOCK_JOINT_SETS_DEG),
         gripper=gripper,
         verify_detection_height=False,
@@ -1489,6 +2084,8 @@ async def _run_mock(args: argparse.Namespace) -> Transform:
         world=world,
         target_prop_name=args.block,
         randomize_seed=args.randomize_seed,
+        randomize_size_range_mm=args.randomize_size_mm,
+        side_scanner=MockSideScanner(side_camera),
         place_prop_name=None if args.no_place else args.place_pad,
         hold_s=args.hold_s,
         mid_hold_reset=(
@@ -1501,6 +2098,21 @@ async def _run_mock(args: argparse.Namespace) -> Transform:
 # ----------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------
+
+
+def _parse_randomize_size_mm(value: str) -> tuple[float, float]:
+    parts = value.split(",")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"--randomize-size-mm wants lo,hi, got {value!r}")
+    try:
+        lo, hi = (float(part) for part in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"--randomize-size-mm wants two numbers, got {value!r}")
+    if not (lo > 0 and hi > 0 and lo <= hi):
+        raise argparse.ArgumentTypeError(
+            f"--randomize-size-mm wants 0 < lo <= hi, got {value!r}"
+        )
+    return (lo, hi)
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -1517,7 +2129,29 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--vision", default="block-segmenter")
     parser.add_argument("--motion", default="builtin")
     parser.add_argument("--block", default="pick_cube")
-    parser.add_argument("--block-size-mm", type=float, default=60.0)
+    parser.add_argument(
+        "--block-size-mm",
+        type=float,
+        default=None,
+        help="override the target block's size (mm) instead of measuring it from the "
+        "focused detection's point cloud; omit to measure (the default)",
+    )
+    parser.add_argument(
+        "--randomize-size-mm",
+        type=_parse_randomize_size_mm,
+        default=None,
+        metavar="LO,HI",
+        help="lo,hi (mm) size range added to the --randomize-seed randomize_props call as "
+        "size_range_mm, for every movable name; warns (never fails) if the measured size "
+        "falls outside it (default off, byte-identical randomize_props payload)",
+    )
+    parser.add_argument(
+        "--mock-block-size-mm",
+        type=float,
+        default=None,
+        help="test-only: fabricate the --mock wrist camera's red block at this metric "
+        "size (mm) instead of the default fixed pixel rectangle",
+    )
     parser.add_argument(
         "--place-pad", default="place_pad", help="fixed prop to set the block down on"
     )
@@ -1579,6 +2213,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="re-randomise the movable blocks' positions (world DoCommand randomize_props) "
         "before this pick, within the table-top region (checklist item 1: two consecutive "
         "picks with re-randomised blocks); default off",
+    )
+    parser.add_argument(
+        "--tallest-camera",
+        default="side-cam",
+        help="fixed side camera measuring the tallest scattered object (phase 4), primary "
+        "source for the dynamic keep-out/carry heights; empty string disables it, falling "
+        "back to the wrist sweep then the --randomize-size-mm range max",
     )
     parser.add_argument(
         "--table",
