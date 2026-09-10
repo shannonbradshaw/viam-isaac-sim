@@ -1874,6 +1874,13 @@ def resolve_joint_indices(
 # never settled; 1e-2 rad/s (0.6 deg/s) is still far below any real motion.
 VEL_EPS_RAD_S = 1e-2
 SETTLE_TOL_RAD = math.radians(0.5)  # commanded-vs-measured gap that counts as arrived
+# The public IsMoving reads motion as joint displacement over this interval
+# rather than an instantaneous velocity: on some boxes PhysX residual velocity
+# noise spikes above VEL_EPS_RAD_S on a stationary arm, so a raw velocity read
+# calls a still arm "moving" (m0 test_is_moving_false_at_rest). Averaging the
+# displacement over ~50 ms (several 60 Hz steps) rejects that noise; measured
+# position on a settled arm does not drift.
+IS_MOVING_SAMPLE_DT_S = 0.05
 # Joint-space moves are executed as a time-synchronized straight line: every
 # joint's target advances so that all joints arrive together, the longest
 # travel at this speed unless the move caps it lower. Handing PhysX the final
@@ -2929,15 +2936,26 @@ class IsaacArmHandle(ArmHandle):
             self._saved_max_joint_velocities = None
 
     def is_moving(self) -> bool:
+        # Motion as displacement over a short interval, not an instantaneous
+        # velocity read: PhysX residual velocity noise on a stationary arm can
+        # exceed VEL_EPS_RAD_S and call a still arm "moving". VEL_EPS_RAD_S
+        # stays the settle machinery's threshold; here it bounds the finite-
+        # difference speed. The off-target term (a stalled arm that never
+        # reached its target keeps reading True) is preserved.
+        def _read():
+            return [float(v) for v in self._art.get_joint_positions(joint_indices=self._joint_indices)]
+
+        p0 = self._sim.run(_read)
+        time.sleep(IS_MOVING_SAMPLE_DT_S)
+
         def _check():
-            vels = self._art.get_joint_velocities(joint_indices=self._joint_indices)
-            is_moving = vels is not None and bool(max(abs(float(v)) for v in vels) > VEL_EPS_RAD_S)
-            if is_moving or self._targets is None:
-                return is_moving
-            positions = self._art.get_joint_positions(joint_indices=self._joint_indices)
+            p1 = _read()
+            speed = max(abs(a - b) for a, b in zip(p1, p0, strict=True)) / IS_MOVING_SAMPLE_DT_S
+            if speed > VEL_EPS_RAD_S or self._targets is None:
+                return speed > VEL_EPS_RAD_S
             return any(
-                abs(float(p) - t) > SETTLE_TOL_RAD
-                for p, t in zip(positions, self._targets, strict=True)
+                abs(p - t) > SETTLE_TOL_RAD
+                for p, t in zip(p1, self._targets, strict=True)
             )
 
         return self._sim.run(_check)
