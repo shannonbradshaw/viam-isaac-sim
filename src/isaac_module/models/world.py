@@ -44,6 +44,12 @@ Attributes:
                                        "sphere_intensity": 30000}. Both keys
                                       optional; unset means leave the stage's
                                       lights alone.
+  oracle_socket (string)            - path of a unix socket the world serves for the
+                                      evaluation oracle (eval/SPEC.md E2): newline-
+                                      delimited JSON, one DoCommand-shaped request per
+                                      line, answered without the oracle_commands gate,
+                                      plus contact_log / clear_contact_log. Local to
+                                      the host; nothing on the network reaches it.
   render (object)                   - render-cost levers applied at boot,
                                       best-effort (CAM-12): {"motion_bvh":
                                       bool, "disable_viewport_updates": bool}.
@@ -79,12 +85,19 @@ DoCommand:
     {"positions": {name: [x,y,z] mm}, "sizes_mm": {name: [x,y,z] mm}}
     ("sizes_mm" is always present: the drawn dims for a ranged prop, its
      current dims otherwise) |
+  {"command": "contact_log", "since"?: unix seconds} ->
+    {"bodies": n, "events": [{"t", "actor0", "actor1", "impulse"}]}
+    (first-touch contacts between rigid bodies under /World; oracle) |
+  {"command": "clear_contact_log"} -> {"ok": true} (oracle) |
   {"command": "ignore_props", "names": [...]} -> {"ignored": [...]}
     (empty list clears; excludes named props from get_geometries - DEC-21:
      excludes the pick target while grasping)
 """
 
 import math
+import threading
+import os
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar, cast
 
@@ -395,6 +408,8 @@ class IsaacWorld(Generic, EasyResource):  # type: ignore[misc]  # SDK: API is Fi
             _validate_render(attrs["render"], bool(attrs.get("livestream", True)))
         if "oracle_commands" in attrs and not isinstance(attrs["oracle_commands"], bool):
             raise ValueError('"oracle_commands" must be true or false')
+        if "oracle_socket" in attrs and not isinstance(attrs["oracle_socket"], str):
+            raise ValueError('"oracle_socket" must be a path string')
         return [], []
 
     def reconfigure(
@@ -423,6 +438,16 @@ class IsaacWorld(Generic, EasyResource):  # type: ignore[misc]  # SDK: API is Fi
         self._serves_floor = not attrs.get("usd_stage")
         if not hasattr(self, "_ignored_props"):
             self._ignored_props: set[str] = set()
+        socket_path = str(attrs.get("oracle_socket", "") or "")
+        server = getattr(self, "_oracle_server", None)
+        if socket_path and (server is None or server.path != socket_path):
+            if server is not None:
+                server.stop()
+            self._oracle_server = _OracleServer(self, socket_path)
+            self._oracle_server.start()
+        elif not socket_path and server is not None:
+            server.stop()
+            self._oracle_server = None
 
     def _handle(self) -> WorldHandle:
         return SimManager.get().world_handle()
@@ -471,9 +496,23 @@ class IsaacWorld(Generic, EasyResource):  # type: ignore[misc]  # SDK: API is Fi
         timeout: float | None = None,
         **kwargs,
     ) -> Mapping[str, ValueTypes]:
+        return self._dispatch(command, gated=True)
+
+    def _dispatch(self, command: Mapping[str, ValueTypes], gated: bool) -> Mapping[str, ValueTypes]:
+        """Every world verb. The API path (do_command) is gated by
+        oracle_commands; the oracle socket calls this with gated=False."""
         handle = self._handle()
         cmd = str(command.get("command", ""))
-        if cmd in _ORACLE_COMMANDS and not getattr(self, "_oracle_commands", True):
+        if cmd == "contact_log":
+            since = float(cast("Any", command.get("since", 0.0)) or 0.0)
+            if gated and not getattr(self, "_oracle_commands", True):
+                raise ValueError("'contact_log' is disabled on this world (oracle_commands is false)")
+            return cast("Mapping[str, ValueTypes]", SimManager.get().contact_log(since))
+        if cmd == "clear_contact_log":
+            if gated and not getattr(self, "_oracle_commands", True):
+                raise ValueError("'clear_contact_log' is disabled on this world (oracle_commands is false)")
+            return cast("Mapping[str, ValueTypes]", SimManager.get().clear_contact_log())
+        if gated and cmd in _ORACLE_COMMANDS and not getattr(self, "_oracle_commands", True):
             raise ValueError(
                 f"{cmd!r} is disabled on this world (oracle_commands is false): scene ground truth "
                 "is not exposed; observe the scene through the cameras"
@@ -579,3 +618,71 @@ class IsaacWorld(Generic, EasyResource):  # type: ignore[misc]  # SDK: API is Fi
             ignored_names = cast("list[ValueTypes]", sorted(self._ignored_props))
             return {"ignored": ignored_names}
         raise ValueError(f"unknown command {cmd!r}; supported: {', '.join(_SUPPORTED_COMMANDS)}")
+
+
+class _OracleServer:
+    """A unix socket the world serves for the evaluation oracle. One JSON
+    object per line in, one per line out: {"ok": true, "result": ...} or
+    {"ok": false, "error": "..."}. Requests are dispatched without the
+    oracle_commands gate. The socket file is owner-only; the harness reads
+    it over ssh as root, so nothing an agent holds (a machine key, network
+    access) reaches ground truth."""
+
+    def __init__(self, world: "IsaacWorld", path: str) -> None:
+        self.world = world
+        self.path = path
+        self._server: Any = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        import socketserver
+
+        world = self.world
+        path = self.path
+
+        class Handler(socketserver.StreamRequestHandler):
+            def handle(self) -> None:
+                for raw in self.rfile:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        req = json.loads(line)
+                        if not isinstance(req, dict):
+                            raise ValueError("request must be a JSON object")
+                        result = world._dispatch(req, gated=False)
+                        out = {"ok": True, "result": result}
+                    except Exception as exc:  # noqa: BLE001
+                        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                    self.wfile.write((json.dumps(out, default=str) + "\n").encode("utf-8"))
+                    self.wfile.flush()
+
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+        srv = socketserver.ThreadingUnixStreamServer(path, Handler)
+        srv.daemon_threads = True
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        self._server = srv
+        self._thread = threading.Thread(target=srv.serve_forever, name="isaac-oracle", daemon=True)
+        self._thread.start()
+        LOGGER.info("oracle socket serving at %s (owner-only)", path)
+
+    def stop(self) -> None:
+        if self._server is not None:
+            try:
+                self._server.shutdown()
+                self._server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._server = None
+        try:
+            if os.path.exists(self.path):
+                os.unlink(self.path)
+        except OSError:
+            pass

@@ -16,6 +16,7 @@ import math
 import queue
 import random
 import sys
+import collections
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -765,6 +766,27 @@ class SimManager:
             out["playing"] = self.run(lambda: bool(self.world.is_playing()))
             out["sim_time"] = self.run(lambda: float(self.world.current_time))
         return out
+
+
+    # ---- contact log for the evaluation oracle (E2) ----
+
+    def _contact_recorder(self) -> "ContactRecorder":
+        rec = getattr(self, "_contact_recorder_obj", None)
+        if rec is None:
+            rec = ContactRecorder(self)
+            self._contact_recorder_obj = rec
+        return rec
+
+    def contact_log(self, since: float = 0.0) -> dict[str, Any]:
+        rec = self._contact_recorder()
+        applied = self.run(rec.enable)
+        return {"bodies": applied, "events": rec.events(since)}
+
+    def clear_contact_log(self) -> dict[str, Any]:
+        rec = self._contact_recorder()
+        applied = self.run(rec.enable)
+        rec.clear()
+        return {"bodies": applied, "ok": True}
 
     def world_handle(self) -> "WorldHandle":
         """The WorldHandle the world component's DoCommand verbs drive
@@ -2114,6 +2136,84 @@ def _draw_sizes_and_positions(
             drawn_dims[name] = (drawn_edge, drawn_edge, drawn_edge)
     placed = _place_props({name: drawn_dims[name] for name in names}, region, rng, min_separation_m)
     return placed, drawn_dims
+
+
+
+class ContactRecorder:
+    """Accumulates first-touch (FOUND) contact events between any rigid bodies
+    under /World, for the evaluation oracle (eval/SPEC.md, E2). PhysX reports
+    a pair when either actor carries PhysxContactReportAPI, so the API goes on
+    every rigid body except the table and the ground plane; contacts with
+    those two are still reported through the other actor and the judge
+    ignores them. Only FOUND events are kept: a resting block reports once
+    when it settles, then nothing, so the log stays small and a carried
+    block touching a wall is one legible event."""
+
+    MAX_EVENTS = 5000
+    SKIP_PREFIXES = ("/World/table", "/World/GroundPlane", "/World/defaultGroundPlane", "/World/ground")
+
+    def __init__(self, sim: "SimManager") -> None:
+        self._sim = sim
+        self._sub: Any = None
+        self._events: collections.deque = collections.deque(maxlen=self.MAX_EVENTS)
+        self._lock = threading.Lock()
+        self._applied = 0
+
+    def enable(self) -> int:
+        """Sim thread. Apply the report API and subscribe, once. Returns the
+        number of rigid bodies carrying the API."""
+        if self._sub is not None:
+            return self._applied
+        import omni.usd
+        from omni.physx import get_physx_simulation_interface
+        from pxr import PhysxSchema, Usd, UsdPhysics
+
+        stage = omni.usd.get_context().get_stage()
+        root = stage.GetPrimAtPath("/World")
+        applied = 0
+        for prim in _prim_range(Usd, root):
+            path = str(prim.GetPath())
+            if prim.IsInstanceProxy() or not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                continue
+            if any(path.startswith(pfx) for pfx in self.SKIP_PREFIXES):
+                continue
+            api = PhysxSchema.PhysxContactReportAPI.Apply(prim)
+            api.CreateThresholdAttr().Set(0.0)
+            applied += 1
+        self._sub = get_physx_simulation_interface().subscribe_contact_report_events(self._on_report)
+        self._applied = applied
+        LOGGER.info("contact log enabled on %d rigid bodies under /World", applied)
+        return applied
+
+    def _on_report(self, contact_headers: Any, contact_data: Any) -> None:
+        from pxr import PhysicsSchemaTools
+
+        now = time.time()
+        new = []
+        for header in contact_headers:
+            kind = str(getattr(header, "type", "")).rsplit(".", 1)[-1]
+            if "FOUND" not in kind:
+                continue
+            a0 = str(PhysicsSchemaTools.intToSdfPath(header.actor0))
+            a1 = str(PhysicsSchemaTools.intToSdfPath(header.actor1))
+            start = int(header.contact_data_offset)
+            impulse = 0.0
+            for i in range(start, start + int(header.num_contact_data)):
+                d = contact_data[i]
+                mag = float(sum(float(v) * float(v) for v in d.impulse)) ** 0.5
+                impulse = max(impulse, mag)
+            new.append({"t": now, "actor0": a0, "actor1": a1, "impulse": impulse})
+        if new:
+            with self._lock:
+                self._events.extend(new)
+
+    def events(self, since: float = 0.0) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(e) for e in self._events if e["t"] >= since]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._events.clear()
 
 
 class WorldHandle:
